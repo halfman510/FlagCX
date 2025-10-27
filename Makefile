@@ -1,9 +1,16 @@
 # 2025 - Modified by MetaX Integrated Circuits (Shanghai) Co., Ltd. All Rights Reserved.
 # 2025 - Modified by DU. All Rights Reserved.
 BUILDDIR ?= $(abspath ./build)
+#已了解的内容：每个模块的作用
+#未了解的内容：
+#$(strip ...)、$(abspath ...) 等 make 的内置函数。
+#-fPIC、-fvisibility=default 等 g++ 的编译选项。
+#-Wl,--no-as-needed、-Wl,-rpath,... 等 g++ 的链接器选项。
+#@mkdir -p \dirname $@`` 这种 shell 命令的具体写法。
+
 
 # set to 0 if not provided
-USE_NVIDIA ?= 0
+USE_NVIDIA ?= 0 #=表示如果这个变量还没有被定义，就设置为0
 USE_ASCEND ?= 0
 USE_ILUVATAR_COREX ?= 0
 USE_CAMBRICON ?= 0
@@ -24,7 +31,7 @@ HOST_CCL_HOME ?=
 MPI_HOME ?=
 UCX_HOME ?=
 
-ifeq ($(strip $(DEVICE_HOME)),)
+ifeq ($(strip $(DEVICE_HOME)),) #如果用户安装了，但没有手动指定DEVICE_HOME，自动猜测最常见的安装路径
 	ifeq ($(USE_NVIDIA), 1)
 		DEVICE_HOME = /usr/local/cuda
 	else ifeq ($(USE_ASCEND), 1)
@@ -48,7 +55,7 @@ ifeq ($(strip $(DEVICE_HOME)),)
 	endif
 endif
 
-ifeq ($(strip $(CCL_HOME)),)
+ifeq ($(strip $(CCL_HOME)),) #设备端集体通信库
 	ifeq ($(USE_NVIDIA), 1)
 		CCL_HOME = /usr/local/nccl/build
 	else ifeq ($(USE_ASCEND), 1)
@@ -72,7 +79,7 @@ ifeq ($(strip $(CCL_HOME)),)
 	endif
 endif
 
-ifeq ($(strip $(HOST_CCL_HOME)),)
+ifeq ($(strip $(HOST_CCL_HOME)),) #主机通信库
 	ifeq ($(USE_GLOO), 1)
 		HOST_CCL_HOME = /usr/local
 	else ifeq ($(USE_MPI), 1)
@@ -88,11 +95,13 @@ ifeq ($(strip $(MPI_HOME)),)
 	endif
 endif
 
-ifeq ($(strip $(UCX_HOME)),)
+#无论底层是哪种高速网络硬件（比如 InfiniBand、RoCE、Ethernet），它都能为上层应用提供一套统一的、极致性能的数据传输接口。
+ifeq ($(strip $(UCX_HOME)),) #UCX 的全称是 Unified Communication X，开源的、高性能的底层通信框架。
 	ifeq ($(USE_UCX), 1)
 		UCX_HOME = /usr/local/ucx
 	endif
 endif
+#---------------------------------上面都是一样的功能
 
 DEVICE_LIB =
 DEVICE_INCLUDE =
@@ -109,7 +118,7 @@ UCX_LIB =
 UCX_INCLUDE =
 UCX_LINK =
 NET_ADAPTOR_FLAG =
-ifeq ($(USE_NVIDIA), 1)
+ifeq ($(USE_NVIDIA), 1) #根据启用的USE开关，设置了真正在g++命令里的参数；LIB库文件搜索路径、INCLUDE头文件搜索路径、LINK链接的具体库名、ADAPTOR_FLAG宏相关
 	DEVICE_LIB = $(DEVICE_HOME)/lib64
 	DEVICE_INCLUDE = $(DEVICE_HOME)/include
 	DEVICE_LINK = -lcudart -lcuda
@@ -224,6 +233,7 @@ else
 	NET_ADAPTOR_FLAG = 
 endif
 
+#定义了输出目录(build/lib, build/obj)，BUILDDIR汇总了所有需要查找的头文件目录
 LIBDIR := $(BUILDDIR)/lib
 OBJDIR := $(BUILDDIR)/obj
 
@@ -234,6 +244,7 @@ INCLUDEDIR := \
 	$(abspath flagcx/adaptor/include) \
 	$(abspath flagcx/service)
 
+#LIBSRCFILES: 使用 wildcard 函数自动查找所有 .cc 源文件，非常灵活，增删代码文件时无需修改 Makefile
 LIBSRCFILES:= \
 	$(wildcard flagcx/*.cc) \
 	$(wildcard flagcx/core/*.cc) \
@@ -243,8 +254,11 @@ LIBSRCFILES:= \
 	$(wildcard flagcx/adaptor/net/*.cc) \
 	$(wildcard flagcx/service/*.cc)
 
+#LIBOBJ: 将所有源文件列表 (.cc) 转换成对应的目标文件列表 (.o)，并指定它们将被放在 OBJDIR 目录下。
 LIBOBJ     := $(LIBSRCFILES:%.cc=$(OBJDIR)/%.o)
 
+#all: 是默认目标，当我们输入 make 时，它就会尝试生成 libflagcx.so。
+#定义了如何将所有编译好的目标文件 (.o) 链接成一个最终的动态库文件 (.so)。这里用到了第3步中设置的所有 -L 和 -l 参数。
 TARGET = libflagcx.so
 all: $(LIBDIR)/$(TARGET)
 
@@ -278,6 +292,11 @@ print_var:
 	@echo "UCX_INCLUDE: $(UCX_INCLUDE)"
 	@echo "NET_ADAPTOR_FLAG: $(NET_ADAPTOR_FLAG)"
 
+#链接规则，定义了如何将任何一个 .cc 源文件编译成一个 .o 目标文件。
+#$< 代表依赖的源文件 (.cc)。
+#$@ 代表生成的目标文件 (.o)。
+#这里用到了第3步中设置的所有 -I (头文件路径) 和最重要的 -D (ADAPTOR_FLAG) 参数。
+#-c 表示只编译不链接，-fPIC 是生成动态库所必需的位置无关代码选项。
 $(LIBDIR)/$(TARGET): $(LIBOBJ)
 	@mkdir -p `dirname $@`
 	@echo "Linking   $@"

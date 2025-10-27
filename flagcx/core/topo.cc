@@ -41,35 +41,41 @@ struct kvDict kvDictPciGen[] = {{"2.5 GT/s", 15},
                                 {"64.0 GT/s PCIe", 480},
                                 {NULL, 60 /* Default fallback */}};
 
+//从指定起点硬件出发，在所有目标类型硬件中，找出和起点通信成本最低的一个或多个最佳设备
+//这个函数有两个，另一个在400多行，两个功能相同，接口不同；这个是动态分配内存
 flagcxResult_t flagcxTopoGetLocal(struct flagcxTopoServer *topoServer, int type,
                                   int index, int resultType, int **locals,
-                                  int *localCount, int *pathType) {
+                                  int *localCount, int *pathType) {//topoServer拓扑图；resultType要找的目标类型，比如找最佳的网卡；locals数组存储找到的最佳设备的索引
   int minType = PATH_DIS;
   float maxBw = 0;
   int count = 0;
   FLAGCXCHECK(flagcxCalloc(locals, topoServer->nodes[resultType].count));
   struct flagcxTopoPath *paths =
-      topoServer->nodes[type].nodes[index].paths[resultType];
+      topoServer->nodes[type].nodes[index].paths[resultType];//之前已经用flagcxTopoComputePaths函数计算并存储了任意两个节点之间的最优路径信息
 
+  //paths指针指向了一个数组，记录了从起点到所有resultType类型设备的最优路径信息
+  //paths[i]包含从起点到第i个resultType设备的最优路径带宽bw和路径类型type
+  //循环遍历所有resultType类型的设备，找到最佳的一个
   for (int i = 0; i < topoServer->nodes[resultType].count; i++) {
     if (paths[i].bw > maxBw ||
-        (paths[i].bw == maxBw && paths[i].type < minType)) {
+        (paths[i].bw == maxBw && paths[i].type < minType)) {//先比较带宽，带宽大直接更新；如果带宽相同，比较路径类型，更优的路径类型值更小
       maxBw = paths[i].bw;
       minType = paths[i].type;
       if (pathType)
         *pathType = minType;
       count = 0;
     }
-    if (paths[i].bw == maxBw && paths[i].type == minType)
-      (*locals)[count++] = i;
+    if (paths[i].bw == maxBw && paths[i].type == minType)//如果当前设备i的路径，带宽和类型都和目前最佳记录值一样
+      (*locals)[count++] = i;//也添加到locals结果数组中，计数器加一
   }
   *localCount = count;
   return flagcxSuccess;
 }
 
+//根据CPU架构类型和微架构类型判断带宽值
 static flagcxResult_t flagcxTopoGetInterCpuBw(struct flagcxTopoNode *cpu,
                                               float *bw) {
-  *bw = LOC_BW;
+  *bw = LOC_BW;//默认带宽值
   if (cpu->cpu.arch == FLAGCX_TOPO_CPU_ARCH_POWER) {
     *bw = P9_BW;
     return flagcxSuccess;
@@ -140,13 +146,15 @@ flagcxResult_t flagcxTopoCreateNode(struct flagcxTopoServer *topoServer,
   return flagcxSuccess;
 }
 
+//给两个给定的硬件节点创建或更新物理连接的边
 flagcxResult_t flagcxTopoConnectNodes(struct flagcxTopoNode *node,
                                       struct flagcxTopoNode *remNode, int type,
-                                      float bw) {
+                                      float bw) {//node和remoteNode是两个节点
   struct flagcxTopoLink *link;
   // check if there's an existing link of this type between node and remNode
+  //边界检查，确保循环不会超出links数组预设的最大长度FLAGCX_TOPO_MAX_LINKS
   for (link = node->links;
-       link - node->links != FLAGCX_TOPO_MAX_LINKS && link->remNode; link++) {
+       link - node->links != FLAGCX_TOPO_MAX_LINKS && link->remNode; link++) {//link - node->links是指针算术，是之间相隔元素的数量，要求两个指向同一个数组内部的指针相减，结果不是内存地址的差值
     if (link->remNode == remNode && link->type == type)
       break;
   }
@@ -336,10 +344,11 @@ flagcxTopoFlattenBcmSwitches(struct flagcxTopoServer *topoServer) {
 // strlen: the length of the netName
 static flagcxResult_t flagcxGetLocalNetFromXmlFile(int devId, char *netName,
                                                    int strlen) {
-  flagcxResult_t ret = flagcxSuccess;
+  flagcxResult_t ret = flagcxSuccess;//状态码，在过程中随时更新
   flagcxXmlNode *node = NULL;
   int dev = -1;
   // step 1: parse the xml file and load it into flagcxXml struct
+  //解析xml文件并加载到flagcxXml结构体
   struct flagcxXml *xml;
   const char *xmlTopoFile = flagcxGetEnv("FLAGCX_TOPO_FILE");
   if (!xmlTopoFile) {
@@ -428,6 +437,8 @@ static flagcxResult_t flagcxTopoRankToIndex(struct flagcxTopoServer *topoServer,
   return flagcxInternalError;
 }
 
+//从指定起点硬件出发，在所有目标类型硬件中，找出和起点通信成本最低的一个或多个最佳设备
+//与上一个函数接口的区别：locals[FLAGCX_TOPO_MAX_NODES]用调用者传入的数组
 static flagcxResult_t flagcxTopoGetLocal(struct flagcxTopoServer *topoServer,
                                          int type, int index, int resultType,
                                          int locals[FLAGCX_TOPO_MAX_NODES],
@@ -674,19 +685,21 @@ flagcxResult_t flagcxTopoGetXmlTopo(struct flagcxHeteroComm *comm,
     // Create top tag
     struct flagcxXmlNode *top;
     // TODO: change root node name from "system" to "root"
-    FLAGCXCHECK(xmlAddNode(xml, NULL, "system", &top));
-    FLAGCXCHECK(xmlSetAttrInt(top, "version", FLAGCX_TOPO_XML_VERSION));
+    FLAGCXCHECK(xmlAddNode(xml, NULL, "system", &top));//创建根节点，命名为system，是整个拓扑的顶层容器
+    FLAGCXCHECK(xmlSetAttrInt(top, "version", FLAGCX_TOPO_XML_VERSION));//记录版本号，便于未来兼容性处理
   }
 
+  //检测硬件设备，APU和加速卡
+  //检测APU
   INFO(FLAGCX_INIT, "start detecting APUs");
   for (int r = 0; r < comm->nRanks; r++) {
-    if (comm->peerInfo[r].hostHash == comm->peerInfo[comm->rank].hostHash) {
+    if (comm->peerInfo[r].hostHash == comm->peerInfo[comm->rank].hostHash) {//检测与当前进程相同的rank，说明只构建当前服务器的拓扑
       INFO(FLAGCX_INIT, "preparing to detect APU for rank %d", r);
       char busId[FLAGCX_DEVICE_PCI_BUSID_BUFFER_SIZE];
       INFO(FLAGCX_INIT, "converting busId to string");
-      FLAGCXCHECK(int64ToBusId(comm->peerInfo[r].busId, busId));
+      FLAGCXCHECK(int64ToBusId(comm->peerInfo[r].busId, busId));//peerinfo中64位整数的busId转成标准的字符串格式
       struct flagcxXmlNode *node;
-      FLAGCXCHECK(flagcxTopoFillApu(xml, busId, &node));
+      FLAGCXCHECK(flagcxTopoFillApu(xml, busId, &node));//调用辅助函数根据busId查找或创建对应的APU XML节点
       if (node == NULL) {
         continue;
       }
@@ -697,9 +710,10 @@ flagcxResult_t flagcxTopoGetXmlTopo(struct flagcxHeteroComm *comm,
     }
   }
 
+  //检测网卡
   int netDevCount = 0;
-  FLAGCXCHECK(comm->netAdaptor->devices(&netDevCount));
-  for (int n = 0; n < netDevCount; n++) {
+  FLAGCXCHECK(comm->netAdaptor->devices(&netDevCount));//通过网络设配器，检测本机有多少个可用的网络设备
+  for (int n = 0; n < netDevCount; n++) {//获取第n个网络设备的详细属性，存入props结构体
     flagcxNetProperties_t props;
     FLAGCXCHECK(comm->netAdaptor->getProperties(n, (void *)&props));
     struct flagcxXmlNode *netNode;
@@ -712,12 +726,13 @@ flagcxResult_t flagcxTopoGetXmlTopo(struct flagcxHeteroComm *comm,
     FLAGCXCHECK(xmlSetAttrInt(netNode, "maxConn", props.maxComms));
   }
 
-  if (comm->rank == 0) {
-    const char *xmlTopoFile = flagcxGetEnv("FLAGCX_TOPO_DUMP_FILE");
+  //写回xml文件
+  if (comm->rank == 0) {//避免多个进程同时写同一个文件，只让rank0执行操作
+    const char *xmlTopoFile = flagcxGetEnv("FLAGCX_TOPO_DUMP_FILE");//检查是否通过环境变量，指定用于转储dump拓扑信息的文件路径
     INFO(FLAGCX_ENV, "FLAGCX_TOPO_DUMP_FILE is %s", xmlTopoFile);
     if (xmlTopoFile && comm->rank == 0) {
       INFO(FLAGCX_INIT, "start dumping topo to xml file");
-      FLAGCXCHECK(flagcxTopoDumpXmlToFile(xmlTopoFile, xml));
+      FLAGCXCHECK(flagcxTopoDumpXmlToFile(xmlTopoFile, xml));//如果指定了路径，就把当前内存构建好的xml拓扑结构序列化写入文件中
     }
   }
   return flagcxSuccess;
@@ -815,6 +830,9 @@ flagcxResult_t flagcxTopoAddApu(struct flagcxXmlNode *xmlApu,
   return flagcxSuccess;
 }
 
+//拓扑图递归构建函数
+//解析一个pci XML节点，判断是PCI桥/交换机，还是一个挂在了实际设备的末端总线，创建相应的拓扑节点和连接，递归处理其下
+// 所有子PCI节点。把树状PCI层级结构，转换成内部的网络拓扑图。
 flagcxResult_t flagcxTopoAddPci(struct flagcxXmlNode *xmlPci,
                                 struct flagcxTopoServer *topoServer,
                                 struct flagcxTopoNode *parent, int serverId) {
@@ -823,6 +841,7 @@ flagcxResult_t flagcxTopoAddPci(struct flagcxXmlNode *xmlPci,
   // Assume default type is PCI
   int type = PCI;
 
+  //从xml的busid属性中，解析出PCI总线ID
   int64_t busId;
   FLAGCXCHECK(xmlGetAttrStr(xmlPci, "busid", &str));
   FLAGCXCHECK(busIdToInt64(str, &busId));
@@ -830,37 +849,41 @@ flagcxResult_t flagcxTopoAddPci(struct flagcxXmlNode *xmlPci,
   struct flagcxTopoNode *node = NULL;
   struct flagcxXmlNode *xmlApu = NULL;
   // check if there is any APU attached to current pci device
-  FLAGCXCHECK(xmlGetSub(xmlPci, "apu", &xmlApu));
-  if (xmlApu != NULL) {
+  //查找APU子节点
+  FLAGCXCHECK(xmlGetSub(xmlPci, "apu", &xmlApu));//xmlGetSub尝试在当前PCI节点下寻找APU子节点
+  if (xmlApu != NULL) {//如果找到
     type = APU;
     // TODO: need to get apu rank info when building xml structure
     // get apu rank here
     FLAGCXCHECK(flagcxTopoCreateNode(topoServer, &node, type,
-                                     FLAGCX_TOPO_ID(serverId, busId)));
-    FLAGCXCHECK(flagcxTopoAddApu(xmlApu, topoServer, node));
+                                     FLAGCX_TOPO_ID(serverId, busId)));//添加到拓扑结构上
+    FLAGCXCHECK(flagcxTopoAddApu(xmlApu, topoServer, node));//填充这个APU具体属性
   }
   struct flagcxXmlNode *xmlNic = NULL;
   // check if there is any APU attached to current pci device
+  //查找网卡子节点
   FLAGCXCHECK(xmlGetSub(xmlPci, "nic", &xmlNic));
   if (xmlNic != NULL) {
     type = NIC;
     // Ignore sub device ID and merge multi-port NICs into one PCI device.
-    busId &= 0xfffffffffffffff0;
+    //多端口网卡合并逻辑，避免拓扑图的过度复杂化
+    busId &= 0xfffffffffffffff0;//把最低四位清零，把同一张物理网卡上的多个端口合并，在拓扑图上表示为单一的网卡节点
     struct flagcxTopoNode *nicNode = NULL;
     int64_t id = FLAGCX_TOPO_ID(serverId, busId);
-    FLAGCXCHECK(flagcxTopoGetNode(topoServer, &nicNode, type, id));
+    FLAGCXCHECK(flagcxTopoGetNode(topoServer, &nicNode, type, id));//根据合并后的busId查找是否已经存在该NIC节点
     if (nicNode == NULL) {
-      FLAGCXCHECK(flagcxTopoCreateNode(topoServer, &nicNode, type, id));
+      FLAGCXCHECK(flagcxTopoCreateNode(topoServer, &nicNode, type, id));//如果不存在，创建一个新NIC节点
       node = nicNode;
     }
 
     FLAGCXCHECK(flagcxTopoAddNic(xmlNic, topoServer, nicNode, serverId));
-  } else if (type == PCI) {
+  } else if (type == PCI) {//如果既不是APU也不是NIC子节点，就是纯PCI总线、桥或Switch
     FLAGCXCHECK(flagcxTopoCreateNode(topoServer, &node, type,
-                                     FLAGCX_TOPO_ID(serverId, busId)));
+                                     FLAGCX_TOPO_ID(serverId, busId)));//创建PCI节点
     // the following block is essentially storing pci device info into a unint64
     // each of the four attributes is 16bit long
     FLAGCXCHECK(xmlGetAttr(xmlPci, "vendor", &str));
+    //PCI设备信息编码，把多个PCI ID打包到一个uint64_t变量的位操作，用来紧凑的存储PCI设备的完整标识
     if (str)
       node->pci.device +=
           strtol(str, NULL, 0)
@@ -876,12 +899,15 @@ flagcxResult_t flagcxTopoAddPci(struct flagcxXmlNode *xmlPci,
       node->pci.device += strtol(str, NULL, 0);
 
     // recursively add sub pci devices
-    for (int s = 0; s < xmlPci->nSubs; s++) {
+    //递归的处理子PCI设备
+    for (int s = 0; s < xmlPci->nSubs; s++) {//遍历所有子节点
       struct flagcxXmlNode *xmlSubPci = xmlPci->subs[s];
-      FLAGCXCHECK(flagcxTopoAddPci(xmlSubPci, topoServer, node, serverId));
+      FLAGCXCHECK(flagcxTopoAddPci(xmlSubPci, topoServer, node, serverId));//核心递归调用，对每一个PCI子节点，
+      // 再次调用自身，并将当前PCI节点node作为其父节点传递下去，构建PCI树状结构
     }
   }
 
+  //把当前节点和上级parent连接起来
   if (node) {
     int width, speed;
     FLAGCXCHECK(xmlGetAttrInt(xmlPci, "link_width", &width));
@@ -889,6 +915,7 @@ flagcxResult_t flagcxTopoAddPci(struct flagcxXmlNode *xmlPci,
     if (width == 0)
       width = 16;
     FLAGCXCHECK(kvConvertToInt(str, &speed, kvDictPciGen));
+    //创建双向的边，构建无向图；width * speed / 80.0是估算PCI带宽
     FLAGCXCHECK(
         flagcxTopoConnectNodes(node, parent, LINK_PCI, width * speed / 80.0));
     FLAGCXCHECK(
@@ -907,27 +934,30 @@ static flagcxResult_t flagcxTopoGetCpuVendor(const char *vendorStr, int *ret) {
   return flagcxSuccess;
 }
 
+//解析XML拓扑并构建CPU节点
 flagcxResult_t flagcxTopoAddCpu(struct flagcxXmlNode *xmlCpu,
                                 struct flagcxTopoServer *topoServer) {
+  //创建CPU节点并填充基本信息
   int numaId;
-  FLAGCXCHECK(xmlGetAttrInt(xmlCpu, "numaid", &numaId));
+  FLAGCXCHECK(xmlGetAttrInt(xmlCpu, "numaid", &numaId));//从cpu标签的numaid属性中，读取这个CPU所属的NUMA节点ID，区分多路CPU服务器中不同CPU
   int serverId;
   FLAGCXCHECK(flagcxGetServerId(topoServer, xmlCpu, &serverId));
   struct flagcxTopoNode *cpu;
   FLAGCXCHECK(flagcxTopoCreateNode(topoServer, &cpu, CPU,
-                                   FLAGCX_TOPO_ID(serverId, numaId)));
+                                   FLAGCX_TOPO_ID(serverId, numaId)));//创建CPU节点
   const char *str;
   FLAGCXCHECK(xmlGetAttr(xmlCpu, "affinity", &str));
   if (str != NULL) {
-    FLAGCXCHECK(flagcxStrToCpuset(str, &cpu->cpu.affinity));
+    FLAGCXCHECK(flagcxStrToCpuset(str, &cpu->cpu.affinity));//读取描述CPU亲和性的字符串，解析成cpuset位掩码，用于后续把计算线程绑定到正确的物理核心
   }
 
+  //深入解析CPU型号与架构
   FLAGCXCHECK(xmlGetAttrStr(xmlCpu, "arch", &str));
-  FLAGCXCHECK(flagcxTopoGetCpuArch(str, &cpu->cpu.arch));
-  if (cpu->cpu.arch == FLAGCX_TOPO_CPU_ARCH_X86) {
+  FLAGCXCHECK(flagcxTopoGetCpuArch(str, &cpu->cpu.arch));//确定CPU架构
+  if (cpu->cpu.arch == FLAGCX_TOPO_CPU_ARCH_X86) {//如果架构是x86
     FLAGCXCHECK(xmlGetAttrStr(xmlCpu, "vendor", &str));
-    FLAGCXCHECK(flagcxTopoGetCpuVendor(str, &cpu->cpu.vendor));
-    if (cpu->cpu.vendor == FLAGCX_TOPO_CPU_VENDOR_INTEL) {
+    FLAGCXCHECK(flagcxTopoGetCpuVendor(str, &cpu->cpu.vendor));//确定硬件厂商
+    if (cpu->cpu.vendor == FLAGCX_TOPO_CPU_VENDOR_INTEL) {//根据厂商和型号ID判断具体微架构，区分这个是因为不同微架构的互联总线带宽和延迟不同，确保后续计算带宽的准确性
       int familyId, modelId;
       FLAGCXCHECK(xmlGetAttrInt(xmlCpu, "familyid", &familyId));
       FLAGCXCHECK(xmlGetAttrInt(xmlCpu, "modelid", &modelId));
@@ -942,6 +972,7 @@ flagcxResult_t flagcxTopoAddCpu(struct flagcxXmlNode *xmlCpu,
         cpu->cpu.model = FLAGCX_TOPO_CPU_TYPE_YONGFENG;
     }
   }
+  //递归处理当前XML节点下的所有子节点
   for (int s = 0; s < xmlCpu->nSubs; s++) {
     struct flagcxXmlNode *node = xmlCpu->subs[s];
     if (strcmp(node->name, "pci") == 0)
@@ -1318,24 +1349,26 @@ getNetNodeFromServers(struct flagcxInterServerTopo *interServerTopo,
   return flagcxSuccess;
 }
 
+//一条路径的最终速度，不是由其最快部分决定，而是由其最慢的部分决定的
 static flagcxResult_t getEffectiveBw(struct flagcxInterServerRoute *route,
                                      float *bw) {
-  float minBw = std::min(route->localNic->net.bw, route->remoteNic->net.bw);
-  for (int i = 0; i < route->switchCount; i++) {
+  float minBw = std::min(route->localNic->net.bw, route->remoteNic->net.bw);//选取本地网卡和远程网卡最小值作为初始值
+  for (int i = 0; i < route->switchCount; i++) {//遍历所有中转站，寻找更窄的瓶颈
     flagcxSwitch *interSwitch = route->switchInfos + i;
-    if (interSwitch->isTop) {
+    if (interSwitch->isTop) {//如果顶级交换机，只需考虑连接到下一级交换机的下行端口带宽
       minBw = std::min(minBw, interSwitch->downBw);
       continue;
     }
     float effBw =
         std::min(interSwitch->downBw, interSwitch->upBw * interSwitch->upLink /
-                                          interSwitch->downLink);
+                                          interSwitch->downLink);//计算真实带宽，收敛比，所有服务器都全力发送数据，每个服务器平均能抢到多少上行带宽
     minBw = std::min(minBw, effBw);
   }
   *bw = minBw;
   return flagcxSuccess;
 }
 
+//处理路由文件XML
 static flagcxResult_t
 flagcxGetInterServerRouteFromFile(const char *xmlFile,
                                   struct flagcxInterServerTopo *interServerTopo,
@@ -1353,13 +1386,14 @@ flagcxGetInterServerRouteFromFile(const char *xmlFile,
   file.close();
 
   // Parse the XML
-  rapidxml::xml_document<> doc;
+  rapidxml::xml_document<> doc;//用第三方库rapidxml解析XML字符串，是轻量级的C++ XML解析库，在原始的字符数组上直接解析
   // Make a copy of the string since rapidxml will modify it during parsing
-  std::vector<char> xmlCopy(xmlContent.begin(), xmlContent.end());
+  std::vector<char> xmlCopy(xmlContent.begin(), xmlContent.end());//rapidxml虽然效率高，但是会直接修改文件，所以这里复制了一份
   xmlCopy.push_back('\0'); // Add null terminator
 
   doc.parse<0>(&xmlCopy[0]);
 
+  //如果根节点或者网卡对不存在，说明XML文件格式不正确，报错
   rapidxml::xml_node<> *rootNode = doc.first_node("interserver_route");
   if (!rootNode) {
     WARN("No root node found in interserver_route XML");
@@ -1372,6 +1406,7 @@ flagcxGetInterServerRouteFromFile(const char *xmlFile,
     return flagcxInternalError;
   }
 
+  //遍历网卡对并查找所有pair节点，每个pair代表一条跨服务器的物理连接
   for (rapidxml::xml_node<> *pairNode = nicPairsNode->first_node("pair");
        pairNode; pairNode = pairNode->next_sibling("pair")) {
     rapidxml::xml_node<> *nic1Node = pairNode->first_node("nic1");
@@ -1381,26 +1416,31 @@ flagcxGetInterServerRouteFromFile(const char *xmlFile,
       return flagcxInternalError;
     }
     rapidxml::xml_attribute<> *guidNic1 = nic1Node->first_attribute("guid");
-    INFO(FLAGCX_GRAPH, "INTERSERVER_ROUTE: guidNic1 = %s", guidNic1->value());
+    INFO(FLAGCX_GRAPH, "INTERSERVER_ROUTE: guidNic1 = %s", guidNic1->value());//从XML属性中，用字符串形式读出两个网卡的GUID
     rapidxml::xml_attribute<> *guidNic2 = nic2Node->first_attribute("guid");
     INFO(FLAGCX_GRAPH, "INTERSERVER_ROUTE: guidNic2 = %s", guidNic2->value());
     // get the actual net node
+    //interServerTopo->netToServerMap执行之前，系统已经构建了从网卡GUID到服务器ID的映射表；通过GUID可以查找出这个
+    // 网卡属于哪一台服务器
     flagcxTopoNode *net1 = nullptr, *net2 = nullptr;
     int serverId1 =
-        interServerTopo->netToServerMap.at(strtoul(guidNic1->value(), NULL, 0));
+        interServerTopo->netToServerMap.at(strtoul(guidNic1->value(), NULL, 0));//strtoul把字符串形式的GUID转换成unsigned long整数
     INFO(FLAGCX_GRAPH, "INTERSERVER_ROUTE: serverId1 = %d", serverId1);
     int serverId2 =
         interServerTopo->netToServerMap.at(strtoul(guidNic2->value(), NULL, 0));
     INFO(FLAGCX_GRAPH, "INTERSERVER_ROUTE: serverId2 = %d", serverId2);
+    //此时已将XML文件中两个GUID和内存中具体的flagcxTopoNode拓扑节点关联了起来
 
+    //创建路由信息+解析交换机信息
+    //为这条连接创建路由对象，并解析路径上可能经过的交换机的信息
     struct flagcxInterServerRoute *route;
-    struct flagcxInterServerRoute *reverseRoute;
+    struct flagcxInterServerRoute *reverseRoute;//创建两条路径，一个正向一个反向
     FLAGCXCHECK(
         flagcxCalloc(&route, 1)); // remember to free this when destroying comm
     FLAGCXCHECK(flagcxCalloc(&reverseRoute, 1));
     FLAGCXCHECK(getNetNodeFromServers(interServerTopo, topoServer,
                                       strtoul(guidNic1->value(), NULL, 0),
-                                      &net1));
+                                      &net1));//getNetNodeFromServers从构建好的拓扑图中，找到这个网卡代表的对象的指针
     FLAGCXCHECK(getNetNodeFromServers(interServerTopo, topoServer,
                                       strtoul(guidNic2->value(), NULL, 0),
                                       &net2));
@@ -1410,6 +1450,7 @@ flagcxGetInterServerRouteFromFile(const char *xmlFile,
     reverseRoute->remoteNic = net1;
 
     // parse interswitch
+    //解析interSwitch
     rapidxml::xml_node<> *interSwitchNode = pairNode->first_node("interSwitch");
     if (!interSwitchNode) {
       WARN("No interSwitch node found in pair");
@@ -1426,6 +1467,7 @@ flagcxGetInterServerRouteFromFile(const char *xmlFile,
     INFO(FLAGCX_GRAPH, "INTERSERVER_ROUTE: switchCount = %d",
          route->switchCount);
     int switchIdx = 0;
+    //遍历每一个switch子节点，对每个交换机解析详细属性
     for (rapidxml::xml_node<> *switchNode =
              interSwitchNode->first_node("switch");
          switchNode;
@@ -1434,14 +1476,14 @@ flagcxGetInterServerRouteFromFile(const char *xmlFile,
       // we don't record interSwitch info for reverseRoute to save space
       // also, interswitch info is only used to compute route bandwidth
       rapidxml::xml_attribute<> *downBwAttr =
-          switchNode->first_attribute("downBw");
-      rapidxml::xml_attribute<> *upBwAttr = switchNode->first_attribute("upBw");
+          switchNode->first_attribute("downBw");//交换机下行带宽
+      rapidxml::xml_attribute<> *upBwAttr = switchNode->first_attribute("upBw");//交换机上行带宽
       rapidxml::xml_attribute<> *upLinkAttr =
-          switchNode->first_attribute("upLink");
+          switchNode->first_attribute("upLink");//交换机上行链路数量
       rapidxml::xml_attribute<> *downLinkAttr =
-          switchNode->first_attribute("downLink");
+          switchNode->first_attribute("downLink");//交换机下行链路数量
       rapidxml::xml_attribute<> *isTopAttr =
-          switchNode->first_attribute("isTop");
+          switchNode->first_attribute("isTop");//标记是否是顶级交换机
       interSwitch->downBw = strtof(downBwAttr->value(), NULL);
       interSwitch->upBw = strtof(upBwAttr->value(), NULL);
       interSwitch->isTop = strtol(isTopAttr->value(), NULL, 0);
@@ -1456,21 +1498,25 @@ flagcxGetInterServerRouteFromFile(const char *xmlFile,
            switchIdx, interSwitch->downBw, interSwitch->upBw,
            interSwitch->isTop, interSwitch->upLink, interSwitch->downLink);
     }
+
+    //计算有效带宽+存储路由
     // get effective bw
     float effectiveBw;
-    FLAGCXCHECK(getEffectiveBw(route, &effectiveBw));
-    route->interBw = effectiveBw;
+    FLAGCXCHECK(getEffectiveBw(route, &effectiveBw));//调用getEffectiveBw函数计算有效带宽
+    route->interBw = effectiveBw;//把算出来的带宽值，赋给正反两个路由对象
     reverseRoute->interBw = effectiveBw;
     INFO(FLAGCX_GRAPH, "INTERSERVER_ROUTE: effectiveBw = %f", effectiveBw);
     interServerTopo
         ->routeMap[route->localNic->net.guid][route->remoteNic->net.guid] =
-        route;
+        route;//存储，routeMap是二维map，第一个key是源网卡的GUID，第二个key是目标网卡的GUID，存入构建好的route对象
     interServerTopo->routeMap[reverseRoute->localNic->net.guid]
                              [reverseRoute->remoteNic->net.guid] = reverseRoute;
   }
   return flagcxSuccess;
 }
 
+//多服务器构建全局拓扑图，把多台服务器各自的本地地图拼接成世界地图
+//通过集体操作跨多个服务器构建全局拓扑视角
 flagcxResult_t
 flagcxGetInterServerTopo(struct flagcxHeteroComm *comm,
                          struct flagcxInterServerTopo **interServerTopo,
@@ -1482,22 +1528,27 @@ flagcxGetInterServerTopo(struct flagcxHeteroComm *comm,
   // FLAGCXCHECK(flagcxCalloc(interServerTopo, 1));
   *interServerTopo = new flagcxInterServerTopo(); // remember to delete this
                                                   // when destroying comm
+  //1、序列化与全局交换
   flagcxInterServerTopo *interServer = *interServerTopo;
-  flatTopoServer *flatServerData;
+  flatTopoServer *flatServerData;//把每个rank的本地拓扑图转换成适合网络传输的形式，分发给其它rank
   FLAGCXCHECK(flagcxCalloc(&flatServerData, nRanks));
   // we need to flatten topoServer first to remove all pointer types in the
   // structure before copying and trasferring it to other ranks
-  FLAGCXCHECK(flattenTopoServer(topoServer, flatServerData + rank));
+  //flagcxTopoServer结构体中包含了大量的指针，通过网络发送一个包含指针的结构体没有意义，因为指针在另一台机器的内存空间是无效地址
+  FLAGCXCHECK(flattenTopoServer(topoServer, flatServerData + rank));//扁平化/序列化，变成不含指针纯数据的结构，用索引或偏移量代替原来的指针
   FLAGCXCHECK(bootstrapAllGather(comm->bootstrap, (void *)flatServerData,
-                                 sizeof(flatTopoServer)));
+                                 sizeof(flatTopoServer)));//全局交换，每个rank都把自己本地的扁平化拓扑图发给其它rank
   FLAGCXCHECK(bootstrapBarrier(comm->bootstrap, rank, nRanks, 0));
 
+  //
   // reorder serverId
-  FLAGCXCHECK(flagcxTopoReorderServerId(flatServerData, nRanks));
+  FLAGCXCHECK(flagcxTopoReorderServerId(flatServerData, nRanks));//对所有rank重新排序和归一化，确保ServerId从0
+  // 开始连续的，并且同一台物理服务器上所有rank有相同的ServerId
 
   // get unique flatServers
   std::map<int, flatTopoServer *> flatServerMap;
-  flatServerMap[flatServerData[0].serverId] = &flatServerData[0];
+  flatServerMap[flatServerData[0].serverId] = &flatServerData[0];//flatServerMap去重，一台服务器上可能运行了多个
+  // rank，flatServerData数组中就会有8份完全相同的拓扑信息，最后确保每台物理服务器信息只被存储一次
   int serverCount = 1;
   for (int i = 1; i < nRanks; i++) {
     auto it = flatServerMap.find(flatServerData[i].serverId);
@@ -1507,25 +1558,29 @@ flagcxGetInterServerTopo(struct flagcxHeteroComm *comm,
     flatServerMap[flatServerData[i].serverId] = &flatServerData[i];
     serverCount++;
   }
+
+  //2、服务器去重与拓扑重建
   // unflatten the flatServers to topoServers
+  //反序列化，是序列化的逆过程
   flagcxTopoServer *topoServers;
   FLAGCXCHECK(flagcxCalloc(&topoServers, serverCount));
   int i = 0;
   for (auto it = flatServerMap.begin(); it != flatServerMap.end(); ++it, i++) {
     flatTopoServer *server = it->second;
-    if (server->hostHashes[server->serverId] == currRankHostHash) {
+    if (server->hostHashes[server->serverId] == currRankHostHash) {//对当前服务器特殊处理，无需扁平化
       // this is the current server, no need to flatten, but neet to change
       // serverId, and node ids
-      topoServer->serverId = server->serverId;
+      topoServer->serverId = server->serverId;//复用已有的topoServer修改ID，避免先拍扁再重建的开销
       topoServer->nHosts = server->nHosts;
       memcpy(topoServer->hostHashes, server->hostHashes,
              sizeof(uint64_t) * FLAGCX_TOPO_MAX_NODES);
       FLAGCXCHECK(flagcxModifyNodeIds(topoServer, server->serverId));
       continue;
     }
-    FLAGCXCHECK(unflattenTopoServer(topoServers + i, server));
+    FLAGCXCHECK(unflattenTopoServer(topoServers + i, server));//对唯一一份flatTopoServer数据，重建回包含指针的对象
     FLAGCXCHECK(flagcxModifyNodeIds(topoServers + i, server->serverId));
     // reconstruct paths because we didn't send path info in allgather
+    //扁平化的数据不包含路径信息，所以重建拓扑图后必须重新调用flagcxTopoComputePaths计算节点间的内部路径
     FLAGCXCHECK(flagcxTopoComputePaths(topoServers + i, comm));
   }
   interServer->numServers = serverCount;
@@ -1533,6 +1588,7 @@ flagcxGetInterServerTopo(struct flagcxHeteroComm *comm,
   interServer->servers = topoServers;
   // populate entries of netToServerIdMap
   FLAGCXCHECK(fillNetToServerMap(interServer, topoServer));
+  //此时每个rank内存都有所有物理服务器的完整拓扑图对象
 
   // verify final topoServers
   // if (rank == 0) {
@@ -1544,7 +1600,10 @@ flagcxGetInterServerTopo(struct flagcxHeteroComm *comm,
   //     }
   //   }
   // }
-  const char *interserverFile = flagcxGetEnv("FLAGCX_INTERSERVER_ROUTE_FILE");
+  
+  //3、搞清服务器之间的连接关系
+  const char *interserverFile = flagcxGetEnv("FLAGCX_INTERSERVER_ROUTE_FILE");//用已有的路由文件，这个文件里定义
+  // 了服务器之间的连接关系和带宽
   if (!interserverFile) {
     INFO(FLAGCX_ENV, "FLAGCX_INTERSERVER_ROUTE_FILE is not set");
     goto exit; // TODO: need to find a way to determine interserver bw if no
@@ -1552,8 +1611,7 @@ flagcxGetInterServerTopo(struct flagcxHeteroComm *comm,
   }
   // parse the interserver route file
   FLAGCXCHECK(flagcxGetInterServerRouteFromFile(interserverFile, interServer,
-                                                topoServer));
-
+                                                topoServer));//解析路由文件，在interServer全局拓扑结构中为不同对象之间添加边
   // record all net guid and serverId mappings
 exit:
   free(flatServerData);

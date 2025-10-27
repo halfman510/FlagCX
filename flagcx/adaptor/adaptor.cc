@@ -7,7 +7,9 @@
 #include "core.h"
 #include "net.h"
 #include <string.h>
-
+/*************************************************************************
+ 条件编译：在C++源码被真正的编译器g++编译成机器码之前，经过预处理器，如果#后面的宏被定义了，就保留这部分代码，交给编译器
+ ************************************************************************/
 #ifdef USE_NVIDIA_ADAPTOR
 #ifdef USE_BOOTSTRAP_ADAPTOR
 struct flagcxCCLAdaptor *cclAdaptors[NCCLADAPTORS] = {&bootstrapAdaptor,

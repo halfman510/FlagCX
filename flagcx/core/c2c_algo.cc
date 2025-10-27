@@ -45,16 +45,18 @@ flagcxInterRankBufferInfoManager::flagcxInterRankBufferInfoManager(
 
 flagcxInterRankBufferInfoManager::~flagcxInterRankBufferInfoManager() {}
 
+//检查新的传输请求是否与已有的请求时空上冲突
 bool flagcxInterRankBufferInfoManager::checkIfPossibleToPush(int clusterId,
                                                              int rank,
                                                              size_t offset,
                                                              size_t count) {
-  if (auto clusterSearch = bufferInfos_.find(clusterId);
+  if (auto clusterSearch = bufferInfos_.find(clusterId);//三层结构查找
       clusterSearch != bufferInfos_.end()) {
-    if (auto rankSearch = clusterSearch->second.find(rank);
+    if (auto rankSearch = clusterSearch->second.find(rank);//三层结构查找
         rankSearch != clusterSearch->second.end()) {
       auto infoList = rankSearch->second;
-      for (auto info : infoList) {
+      for (auto info : infoList) {//遍历列表中的计划
+        //下面的if包括三种重叠情况，1、后半段落在info内 2、完全重合 3、前半段落在info内
         if ((offset < info.offset_ && offset + count > info.offset_) ||
             offset == info.offset_ ||
             (offset > info.offset_ && offset < info.offset_ + info.count_)) {
@@ -66,26 +68,30 @@ bool flagcxInterRankBufferInfoManager::checkIfPossibleToPush(int clusterId,
   return true;
 }
 
+//如果大传输请求因为中间某个计划无法被直接调度，检查是否可以把大请求差分，利用冲突前面或后面空闲的时间，先传输一部分数据
 bool flagcxInterRankBufferInfoManager::checkIfPossibleToSplitAndPush(
     int clusterId, int rank, size_t offset, size_t count, size_t *splitCount,
     int *pushMode) {
-  size_t maxSplitCount = 0;
-  int finalPushMode = 0; // 0: prePush, 1: postPush
-  if (auto clusterSearch = bufferInfos_.find(clusterId);
+  size_t maxSplitCount = 0;//记录见缝插针后可传输的最大数据块大小
+  int finalPushMode = 0; // 0: prePush, 1: postPush 返回在冲突块之前还是之后传输
+  if (auto clusterSearch = bufferInfos_.find(clusterId);//三层结构查找
       clusterSearch != bufferInfos_.end()) {
-    if (auto rankSearch = clusterSearch->second.find(rank);
+    if (auto rankSearch = clusterSearch->second.find(rank);//三层结构查找
         rankSearch != clusterSearch->second.end()) {
       auto infoList = rankSearch->second;
-      for (auto info : infoList) {
-        if (offset < info.offset_ && offset + count > info.offset_) {
+      for (auto info : infoList) {//遍历列表中的计划
+        if (offset < info.offset_ && offset + count > info.offset_) {//检查新请求[offset, offset+count)是否
+        // 跨越已存在的计划info起始点。如果是，那info前面的区间可能是空闲的窗口，递归调用checkIfPossibleToPush确
+        // 认小窗口是否可用，因为可能与更早的计划冲突
           if (checkIfPossibleToPush(clusterId, rank, offset,
                                     info.offset_ - offset)) {
-            maxSplitCount = std::max(info.offset_ - offset, maxSplitCount);
+            maxSplitCount = std::max(info.offset_ - offset, maxSplitCount);//如果可用，计算出长度并更新最大可用窗口
             finalPushMode = 0;
           }
         }
+        //类似的，检测info后面是否有空闲的窗口可用
         if (offset >= info.offset_ && offset < info.offset_ + info.count_ &&
-            offset + count > info.offset_ + info.count_) {
+            offset + count > info.offset_ + info.count_) {//递归调用checkIfPossibleToPush确认后面的小窗口是否可用
           if (checkIfPossibleToPush(clusterId, rank, info.offset_ + info.count_,
                                     offset + count - info.offset_ -
                                         info.count_)) {
@@ -95,7 +101,7 @@ bool flagcxInterRankBufferInfoManager::checkIfPossibleToSplitAndPush(
           }
         }
       }
-      if (maxSplitCount > 0) {
+      if (maxSplitCount > 0) {//有最大可用窗口，就返回true
         *splitCount = maxSplitCount;
         *pushMode = finalPushMode;
         return true;
@@ -105,6 +111,8 @@ bool flagcxInterRankBufferInfoManager::checkIfPossibleToSplitAndPush(
   return false;
 }
 
+//下面是一套CURD接口，供C2C Planner等上层模块使用
+//判断特定rank的缓冲通信区是否已满
 bool flagcxInterRankBufferInfoManager::checkIsFull(int clusterId, int rank) {
   int rankCount = 0;
   if (auto clusterSearch = bufferInfos_.find(clusterId);
@@ -117,12 +125,14 @@ bool flagcxInterRankBufferInfoManager::checkIsFull(int clusterId, int rank) {
       }
     }
   }
-  if (rankCount == totalCount_) {
+  if (rankCount == totalCount_) {//用计划中所有占用量的总和与总缓冲区大小totalCount_比较
     return true;
   }
   return false;
 }
 
+//检查特定rank的所有待处理的通信任务，是否都处于“已调度”的状态
+//可用于同步点，进入下一个大规划之前，判断当前所有阶段已经提交的任务都被后台的Proxy Service接收并开始处理
 bool flagcxInterRankBufferInfoManager::checkIsScheduled(int clusterId,
                                                         int rank) {
   if (auto clusterSearch = bufferInfos_.find(clusterId);
@@ -131,7 +141,7 @@ bool flagcxInterRankBufferInfoManager::checkIsScheduled(int clusterId,
         rankSearch != clusterSearch->second.end()) {
       auto infoList = rankSearch->second;
       for (auto info : infoList) {
-        if (!info.isScheduled_) {
+        if (!info.isScheduled_) {//只要有一个isScheduled_标志为false，函数就返回false
           return false;
         }
       }
@@ -140,6 +150,7 @@ bool flagcxInterRankBufferInfoManager::checkIsScheduled(int clusterId,
   return true;
 }
 
+//获取特定clusterId 和 rank对应的list表
 std::list<flagcxBufferInfo> &
 flagcxInterRankBufferInfoManager::getBufferInfoList(int clusterId, int rank) {
   if (auto clusterSearch = bufferInfos_.find(clusterId);
@@ -147,7 +158,7 @@ flagcxInterRankBufferInfoManager::getBufferInfoList(int clusterId, int rank) {
     if (auto rankSearch = clusterSearch->second.find(rank);
         rankSearch != clusterSearch->second.end()) {
       return rankSearch->second;
-    } else {
+    } else {//如果这两层有任意一层没有找到，就创建一个空的list并插入map中，返回这个新建list的引用
       clusterSearch->second[rank] = {};
       return clusterSearch->second[rank];
     }
@@ -157,6 +168,7 @@ flagcxInterRankBufferInfoManager::getBufferInfoList(int clusterId, int rank) {
   }
 }
 
+//增
 void flagcxInterRankBufferInfoManager::pushBackBufferInfo(
     int clusterId, int rank, size_t offset, size_t count, int clusterIdToSend,
     int isRecv, int isScheduled, int peerRank, int loopId) {
@@ -164,6 +176,7 @@ void flagcxInterRankBufferInfoManager::pushBackBufferInfo(
       offset, count, clusterIdToSend, isRecv, isScheduled, peerRank, loopId);
 }
 
+//删
 void flagcxInterRankBufferInfoManager::popFrontBufferInfo(int clusterId,
                                                           int rank) {
   bufferInfos_[clusterId][rank].pop_front();
@@ -256,6 +269,7 @@ flagcxC2cHomoFunc::flagcxC2cHomoFunc(
       homoType_(homoType), commOp_(commOp),
       interRankBufferInfoManager_(interRankBufferInfoManager) {}
 
+      //两个析构函数
 flagcxC2cHomoFunc::flagcxC2cHomoFunc(FILE *file, size_t chunksize) {
   char line[LINE_LEN];
 
@@ -283,6 +297,9 @@ flagcxC2cHomoFunc::flagcxC2cHomoFunc(FILE *file, size_t chunksize) {
 
 flagcxC2cHomoFunc::~flagcxC2cHomoFunc() {}
 
+//roxy Service的工人线程flagcxProxyProgress执行到HomoFunc步骤时，调用run方法
+//接收执行时的动态上下文，如 sendbuff (总输入缓冲区), recvbuff (总输出缓冲区), 
+// scratchbuff (临时缓冲区), comm (通信器句柄), stream (设备流) 等。
 flagcxResult_t flagcxC2cHomoFunc::run(const void *sendbuff, void *recvbuff,
                                       void *scratchbuff,
                                       flagcxDataType_t datatype,
@@ -290,13 +307,17 @@ flagcxResult_t flagcxC2cHomoFunc::run(const void *sendbuff, void *recvbuff,
                                       flagcxComm_t comm, flagcxStream_t stream,
                                       size_t *sendCounts, size_t *sDispls,
                                       size_t *recvCounts, size_t *rDispls) {
-  if (homoType_ == 1 && comm->homoInterMyRank == -1) {
+  if (homoType_ == 1 && comm->homoInterMyRank == -1) {//homoType_ == 1是集群间操作，comm->homoInterMyRank == -1检查
+  // 当前进程是否为外交官，如果不是=-1，说明没有资格参与这次通信，函数直接返回，什么都不做
     return flagcxSuccess;
   }
 
+  //用sendType_和recvType_标志使用哪个缓冲区，0=输入, 1=输出, 2=临时
+  //sendType_如果是0=输入sendbuff, 1=输出recvbuff, 2=临时scratchbuff
   void *actualSendbuff = sendType_ == 0
                              ? const_cast<void *>(sendbuff)
                              : (sendType_ == 1 ? recvbuff : scratchbuff);
+  //recvType_如果是1=输出recvbuff。否则是临时scratchbuff
   void *actualRecvbuff = recvType_ == 1 ? recvbuff : scratchbuff;
 
   TRACE_CALL("flagcxC2cHomoFunc run: rank = %d, rootRank = %d, sendType = %d, "
@@ -306,7 +327,7 @@ flagcxResult_t flagcxC2cHomoFunc::run(const void *sendbuff, void *recvbuff,
              comm->rank, rootRank_, sendType_, recvType_, sendOffset_,
              recvOffset_, count_, homoType_, commOp_, datatype, redOp, root);
 
-  switch (commOp_) {
+  switch (commOp_) {//根据不同的操作类型进入不同的分支，调用的终点
     case flagcxCommOpReduce:
       return cclAdaptors[flagcxCCLAdaptorDevice]->reduce(
           const_cast<const void *>(static_cast<void *>(
@@ -315,7 +336,7 @@ flagcxResult_t flagcxC2cHomoFunc::run(const void *sendbuff, void *recvbuff,
           static_cast<void *>(static_cast<char *>(actualRecvbuff) +
                               recvOffset_ * getFlagcxDataTypeSize(datatype)),
           count_, datatype, redOp, (rootRank_ == -1) ? root : rootRank_,
-          homoType_ == 1 ? comm->homoInterComm : comm->homo_comm, stream);
+          homoType_ == 1 ? comm->homoInterComm : comm->homo_comm, stream);//选择正确的通信器，集群间用homoInterComm，集群内用homo_comm
     case flagcxCommOpAllReduce:
       return cclAdaptors[flagcxCCLAdaptorDevice]->allReduce(
           const_cast<const void *>(static_cast<void *>(
@@ -1223,12 +1244,16 @@ flagcxResult_t flagcxC2cPlanner::refresh(int isSendRecv) {
   return flagcxSuccess;
 }
 
+//异构通信P2P调度算法，是负载均衡和调度逻辑的具体实现
+//遍历所有需要进行的跨集群数据传输请求，通过可配置的搜索策略（轮询或顺序），为每一个请求从模板集群的代理细节中寻找有空的
+//接收者，进行整体调度或拆分调度
 flagcxResult_t flagcxC2cPlanner::searchHeteroSendRecvOps(int searchMethod,
                                                          int loopId) {
   // cluster j send to cluster z, cluster z recv from cluster j
-  for (size_t j = 0; j < clusterInterRankList_.size(); ++j) {
-    for (size_t z = j + 1; z < clusterInterRankList_.size(); ++z) {
-      for (size_t r1 = 0; r1 < clusterInterRankList_[j].size(); ++r1) {
+  //三层循环是为了系统性地找出所有需要调度的发送任务
+  for (size_t j = 0; j < clusterInterRankList_.size(); ++j) {//遍历所有源集群
+    for (size_t z = j + 1; z < clusterInterRankList_.size(); ++z) {//遍历所有目标集群
+      for (size_t r1 = 0; r1 < clusterInterRankList_[j].size(); ++r1) {//遍历源集群中的每一个代理
         auto &jList = interRankBufferInfoManager_.getBufferInfoList(
             j, clusterInterRankList_[j][r1]);
         for (auto it = jList.begin(); it != jList.end();) {
@@ -1400,8 +1425,9 @@ flagcxResult_t flagcxC2cPlanner::findStrategy() {
                                    comm_->clusterInterRankList[i].size()));
     }
   }
-  refresh(1);
+  refresh(1);//重置规划器内部状态
   // setup refreshFunc
+  //创建一个refreshFunc对象
   int bufftype = 1;
   int startoffset = 0;
   if (commOp_ == flagcxCommOpReduceScatter || commOp_ == flagcxCommOpScatter ||
@@ -1413,26 +1439,29 @@ flagcxResult_t flagcxC2cPlanner::findStrategy() {
       algorithm_ == flagcxAlgoPipeline) {
     startoffset = clusterOffset_ * totalCount_ / comm_->nranks;
   }
+  //初始化
+  //根据已存在的流水线状态，智能创建一个flagcxC2cRefreshFunc对象，以便本次规划操作完成后，正确更新和清理缓冲区
   if (!interRankBufferInfoManager_.getBufferInfoList(clusterId_, rank_)
-           .empty()) {
+           .empty()) {//如果当前rank的缓冲区调度列表不为空，说明当前有正在进行的流水线操作，进入复杂逻辑计算
     auto &bufferList =
         interRankBufferInfoManager_.getBufferInfoList(clusterId_, rank_);
     size_t offset = 0;
     size_t count = 0;
     size_t totalCount = 0;
     int counter = 0;
-    for (auto it = bufferList.begin(); it != bufferList.end(); ++it) {
+    for (auto it = bufferList.begin(); it != bufferList.end(); ++it) {//遍历调度列表，找到未被调度的ReduceScatter
+    // 或AllReduce操作
       if ((commOp_ == flagcxCommOpReduceScatter ||
            commOp_ == flagcxCommOpAllReduce) &&
           !(it->isScheduled_) && algorithm_ == flagcxAlgoPipeline) {
         continue;
       }
-      if (algorithm_ == flagcxAlgoPipeline) {
+      if (algorithm_ == flagcxAlgoPipeline) {//复杂偏移计算
         offset = it->offset_;
         count = it->count_;
         totalCount = totalCount_;
         if (commOp_ == flagcxCommOpReduceScatter) {
-          offset -= clusterOffset_ * recvCount_;
+          offset -= clusterOffset_ * recvCount_;//全局的缓冲区偏移量需要被转换成相对于当前同构子集群的本地偏移量
           totalCount = comm_->cluster_sizes[clusterId_] * recvCount_;
         } else if (commOp_ == flagcxCommOpAllReduce) {
           offset -= clusterOffset_ * totalCount_ / comm_->nranks;
@@ -1448,12 +1477,15 @@ flagcxResult_t flagcxC2cPlanner::findStrategy() {
       count += it->count_;
       counter++;
     }
+    //用计算出的本地偏移量和数据量，创建flagcxC2cRefreshFunc对象
     refreshFunc_ = flagcxC2cRefreshFunc(bufftype, startoffset, offset, count,
                                         totalCount, redOp_);
-  } else {
+  } else {//如果当前rank的缓冲区调度列表为空，说明是全新的操作，没有任何流水线状态
+    //直接用0和totalCount_创建一个默认的refreshFunc_
     refreshFunc_ = flagcxC2cRefreshFunc(0, 0, totalCount_, redOp_);
   }
 
+  //根据通信类型，重置优化标志——Planner根据不同的通信操作，动态调整优化策略
   // reset multiNic_ based on comm op type
   // since broadcast, alltoall, alltoallv, scatter, gather ops behave
   // identically in both single-nic and multi-nic modes, no special handling is
@@ -1461,40 +1493,51 @@ flagcxResult_t flagcxC2cPlanner::findStrategy() {
   if (commOp_ == flagcxCommOpBroadcast || commOp_ == flagcxCommOpAlltoAll ||
       commOp_ == flagcxCommOpAlltoAllv || commOp_ == flagcxCommOpScatter ||
       commOp_ == flagcxCommOpGather) {
-    multiNic_ = 1;
+    multiNic_ = 1;//重置是否启用多网卡负载均衡优化标志
+    //强制设置成1，单网卡模式，假装只有一张网卡，多网卡优化对它们不适用，与其设计一套复杂的多网卡算法，直接走简单的单网卡
   }
 
   // reset eachNicPerRank_ based on comm op type
   // since alltoall, alltoallv ops behave identically in both
   // normal and rank-local multi-nic modes
   if (commOp_ == flagcxCommOpAlltoAll || commOp_ == flagcxCommOpAlltoAllv) {
-    eachNicPerRank_ = 1;
+    eachNicPerRank_ = 1;//控制每个rank使用独立的网卡优化模式，精细的rank-NIC绑定很复杂，为了简化强制设置1普通模式
   }
 
-  int recvType = 1;
+  //根据commOp_，为后续创建flagcxC2cHomoFunc等步骤预先确定应该使用哪种类型的发送和接收缓冲区
+  int recvType = 1;//接收缓冲区默认是1
   // if scratch buffer is needed
   if (commOp_ == flagcxCommOpReduceScatter || commOp_ == flagcxCommOpScatter ||
       (commOp_ == flagcxCommOpGather && rank_ != rootRank_)) {
-    recvType = 2;
+    recvType = 2;//对于ReduceScatter、Scatter等操作，每个rank只接收最终结果的一部分，如果直接写入最终的recvbuff很混
+    // 乱，所以先把接收到的数据写入临时的scratchbuff
   }
   int sendType =
       (commOp_ == flagcxCommOpAlltoAll || commOp_ == flagcxCommOpAlltoAllv ||
        (commOp_ == flagcxCommOpScatter && rank_ == rootRank_) ||
        (commOp_ == flagcxCommOpAllGather && eachNicPerRank_ && multiNic_))
           ? 0
-          : recvType;
+          : recvType;//对于AlltoAll, Scatter等操作，数据从原始的输入缓冲区sendbuff发出，所以sendType设为0；对于其它
+          // 大部分操作，发送的数据是上一阶段的计算结果，已经存在了，所以直接沿用recvType的值
 
+  //findStrategy的核心实现部分，负责preHomoFuncSteps构建同构预处理步骤的执行计划
+  //根据多网卡multiNic_和rank本地网卡eachNicPerRank_的配置，还有上层通信操作commOp_的类型，分层的决定在集群内应该执行哪种
+  // 原生通信库，并为该操作精确地计算出所有参数，创建flagcxC2cHomoFunc对象并存入步骤列表中
   if (multiNic_) {
     // multi-nic
     // setup preHomoFuncs
-    if (eachNicPerRank_) {
+    //给多网卡环境设置了两种规划
+    if (eachNicPerRank_) {//if的情况：每个rank都使用独立的网卡
+      //简化的多网卡模型，假设每个rank都独立地参与跨集群通信
       // inter ranks equaling to homo ranks
       // setup preHomoFuncs
-      flagcxCommOp_t preHomoFuncCommOp = getC2cHomoCommOp(0, 0);
+      flagcxCommOp_t preHomoFuncCommOp = getC2cHomoCommOp(0, 0);//调用辅助函数getC2cHomoCommOp，pre-homo阶段
+      // 应该执行的最佳原生集体通信操作，0, 0 可能是代表 (stage=pre, mode=each_rank_is_proxy) 的标志
       auto &buffer =
           interRankBufferInfoManager_.getBufferInfoList(clusterId_, rank_)
               .front();
-      if (preHomoFuncCommOp == flagcxCommOpReduceScatter) {
+      if (preHomoFuncCommOp == flagcxCommOpReduceScatter) {//如果getC2cHomoCommOp返回的最佳操作是ReduceScatter，
+      // 是AllReduce的第一步，进入一个复杂的参数计算逻辑
         if (commOp_ == flagcxCommOpReduce ||
             algorithm_ == flagcxAlgoSequential) {
           preHomoFuncSteps_[0].emplace_back(
@@ -1503,17 +1546,21 @@ flagcxResult_t flagcxC2cPlanner::findStrategy() {
         } else {
           size_t dataoffset = 0;
           size_t rankCount = totalCount_ / comm_->nranks;
-          for (int c = 0; c < comm_->nclusters; ++c) {
+          for (int c = 0; c < comm_->nclusters; ++c) {//循环为了流水线Pipelining，为未来和其它集群c的通信，提前规
+          // 划好本次pre-homo操作所需的数据
             size_t clusterdata = rankCount * comm_->cluster_sizes[c];
             size_t preHomoFuncCount =
-                clusterdata / clusterInterRankList_[clusterId_].size();
+                clusterdata / clusterInterRankList_[clusterId_].size();//计算要发送给c的那部分数据，当前集群内需
+                // 要处理的数据块大小
             size_t preHomoFuncRes =
                 clusterdata % clusterInterRankList_[clusterId_].size();
+                //step的计算是环形流水线的核心，确保了环上不同集群同一时间步骤处理不同的数据块
             int step =
                 (clusterId_ + comm_->nclusters - 1 - c) % comm_->nclusters;
             if (step == comm_->nclusters - 1) {
               step = 0;
             }
+            //最终的执行指令，创建一个flagcxC2cHomoFunc对象，并放入对应步骤step列表中
             preHomoFuncSteps_[step].emplace_back(
                 -1, 0, recvType, dataoffset,
                 dataoffset + preHomoFuncCount * homoMyRank_, preHomoFuncCount,
@@ -1529,7 +1576,8 @@ flagcxResult_t flagcxC2cPlanner::findStrategy() {
             dataoffset += clusterdata;
           }
         }
-      } else if (preHomoFuncCommOp == flagcxCommOpAllGather) {
+      } else if (preHomoFuncCommOp == flagcxCommOpAllGather) {//处理Reduce和AllGather等其它情况，为其它commOp_
+        //类型都提供了对应的更简单的pre-homo步骤生成逻辑，简单创建一个flagcxC2cHomoFunc对象并放入preHomoFuncSteps_[0]
         preHomoFuncSteps_[0].emplace_back(-1, 0, recvType, 0,
                                           clusterOffset_ * sendCount_,
                                           sendCount_, 0, preHomoFuncCommOp);
@@ -1557,12 +1605,14 @@ flagcxResult_t flagcxC2cPlanner::findStrategy() {
         preHomoFuncSteps_[0].emplace_back(-1, 0, recvType, 0, 0, totalCount_, 0,
                                           preHomoFuncCommOp);
       }
-    } else {
+    } else {//else的情况：多个rank共享网卡，需要代理外交官，只有被选中的rank才能跨集群通信（标准的、复杂的多网卡模型）
       // otherwise
-      flagcxCommOp_t preHomoFuncCommOp = getC2cHomoCommOp(0, 1);
-      if (preHomoFuncCommOp == flagcxCommOpReduce) {
-        for (int i = 0; i < clusterInterRankList_[clusterId_].size(); ++i) {
-          for (auto &buffer : interRankBufferInfoManager_.getBufferInfoList(
+      //为每一个外交官都生成一个Reduce任务，让集群内一部分成员，把它们的局部计算结果规约到这个外交官身上
+      flagcxCommOp_t preHomoFuncCommOp = getC2cHomoCommOp(0, 1);//调用getC2cHomoCommOp，这次参数（0，1）代表
+      //(stage=pre, mode=proxy_based)
+      if (preHomoFuncCommOp == flagcxCommOpReduce) {//这种模式下，pre-homo阶段的最佳操作通常是Reduce
+        for (int i = 0; i < clusterInterRankList_[clusterId_].size(); ++i) {//遍历本集群所有外交官
+          for (auto &buffer : interRankBufferInfoManager_.getBufferInfoList(//遍历每个外交官需要处理的缓冲区信息
                    clusterId_, clusterInterRankList_[clusterId_][i])) {
             int step = 0;
             if (commOp_ != flagcxCommOpReduce &&
@@ -1574,12 +1624,13 @@ flagcxResult_t flagcxC2cPlanner::findStrategy() {
                 step = 0;
               }
             }
+            //创建Reduce指令，指令的目标root是clusterInterRankList_[clusterId_][i]，也就是其中一个外交官
             preHomoFuncSteps_[step].emplace_back(
                 clusterInterRankList_[clusterId_][i] - (rank_ - homoMyRank_), 0,
                 recvType, buffer.offset_, buffer.offset_, buffer.count_, 0,
                 preHomoFuncCommOp);
           }
-        }
+        }//类型都提供了对应的更简单的pre-homo步骤生成逻辑，简单创建一个flagcxC2cHomoFunc对象并放入preHomoFuncSteps_[0]
       } else if (preHomoFuncCommOp == flagcxCommOpAllGather) {
         preHomoFuncSteps_[0].emplace_back(-1, 0, recvType, 0,
                                           clusterOffset_ * sendCount_,
@@ -1601,19 +1652,24 @@ flagcxResult_t flagcxC2cPlanner::findStrategy() {
       }
     }
 
+    //---确定和构建跨集群通信heteroFuncSteps_和代理间通信homoInterFuncSteps_的具体执行步骤
+    //根据不同的通信操作类型commOp_，决定是用简单的点对点通信模式，还是用复杂的基于缓冲区管理器和搜索算法优化的流水线调度模式
     // determine hetero send/recv strategies
     // and setup homoInterFuncs
-    if (commOp_ == flagcxCommOpAlltoAll) {
+
+    //AlltoAll绕过复杂的代理和流水线机制，直接让每一个rank和其它集群的rank建立P2P连接交换数据，虽然不够高效，但是逻辑简单
+    if (commOp_ == flagcxCommOpAlltoAll) {//针对AlltoAll全交换通信模式的简化策略
       flagcxC2cHeteroFunc heteroFunc = flagcxC2cHeteroFunc();
-      for (size_t i = 0; i < comm_->nranks; ++i) {
-        if (clusterId_ != comm_->cluster_ids[i]) {
+      for (size_t i = 0; i < comm_->nranks; ++i) {//循环遍历所有ranks
+        if (clusterId_ != comm_->cluster_ids[i]) {//判断目标rank i是否与当前进程不属于同一个集群
+          //如果不属于一个集群，直接创建点对点的send和recv操作
           heteroFunc.addP2pOp(rank_, i, i * sendCount_, sendCount_, 0);
           heteroFunc.addP2pOp(rank_, i, i * recvCount_, recvCount_, 1);
         }
       }
       heteroFuncSteps_[0].push_back(std::move(heteroFunc));
       homoInterFuncSteps_[0].emplace_back(-1, sendType, recvType, 0, 0,
-                                          totalCount_, 1, flagcxCommNoOp);
+                                          totalCount_, 1, flagcxCommNoOp);//简化，不需要复杂的代理间协调，代理什么都不用做
     } else if (commOp_ == flagcxCommOpAlltoAllv) {
       flagcxC2cHeteroFunc heteroFunc = flagcxC2cHeteroFunc();
       for (size_t i = 0; i < comm_->nranks; ++i) {
@@ -1629,15 +1685,17 @@ flagcxResult_t flagcxC2cPlanner::findStrategy() {
       heteroFuncSteps_[0].push_back(std::move(heteroFunc));
       homoInterFuncSteps_[0].emplace_back(-1, sendType, recvType, 0, 0,
                                           totalCount_, 1, flagcxCommNoOp);
-    } else {
+    } else {//针对AllReduce,ReduceScatter,AllGather等可以被高度优化的集体通信操作的的核心智能调度逻辑
       int heteroAndHomoInterFuncLoops = 1;
       for (int i = 0; i < heteroAndHomoInterFuncLoops; ++i) {
         // search by BFS or DFS
-        searchHeteroSendRecvOps(1, i);
+        searchHeteroSendRecvOps(1, i);//路径搜索算法，和flagcxInterRankBufferInfoManager紧密协作，可能基于BFS或
+        //DFS在当前的拓扑和缓冲区状态下，搜索出一条或多条最优的无冲突的P2P路径
 
         int scheduleCompleted = 1;
         for (size_t j = 0; j < clusterInterRankList_.size(); ++j) {
           for (size_t z = 0; z < clusterInterRankList_[j].size(); ++z) {
+            //checkIsScheduled是检查点，确保searchHeteroSendRecvOps已为所有代理节点的所有缓冲区都制定好了传输计划
             if (!interRankBufferInfoManager_.checkIsScheduled(
                     j, clusterInterRankList_[j][z])) {
               scheduleCompleted = 0;
@@ -1650,23 +1708,25 @@ flagcxResult_t flagcxC2cPlanner::findStrategy() {
         }
 
         // setup heteroFuncs
+        //在searchHeteroSendRecvOps执行完之后，时刻表interRankBufferInfoManager_中已有所有被批准的P2P传输
         std::vector<flagcxC2cHeteroFunc> heteroFuncStep;
         for (size_t s = 0;
              s < nSeqInterSteps_ + nPipePreSteps_ + nPipePostSteps_; ++s) {
           heteroFuncStep.emplace_back();
         }
+        //遍历时刻表，对每一个被标记为isScheduled_的条目，创建对应的flagcxC2cP2pOp对象，添加到heteroFuncStep列表中
         for (size_t j = 0; j < clusterInterRankList_.size(); ++j) {
           for (size_t z = 0; z < clusterInterRankList_[j].size(); ++z) {
             if (rank_ == clusterInterRankList_[j][z]) {
               auto &rankList =
                   interRankBufferInfoManager_.getBufferInfoList(j, rank_);
-              for (auto it = rankList.begin(); it != rankList.end(); ++it) {
-                if (it->isScheduled_ && it->loopId_ == i) {
+              for (auto it = rankList.begin(); it != rankList.end(); ++it) {//遍历时刻表
+                if (it->isScheduled_ && it->loopId_ == i) {//对每一个被标记为isScheduled_的条目
                   size_t offset =
                       ((!it->isRecv_ && commOp_ == flagcxCommOpAllGather &&
                         eachNicPerRank_)
                            ? 0
-                           : it->offset_);
+                           : it->offset_);//计算偏移
                   if (nPipePreSteps_ + nSeqInterSteps_ + nPipePostSteps_ > 1) {
                     if (it->peerRank_ == -1) {
                       continue;
@@ -1679,7 +1739,9 @@ flagcxResult_t flagcxC2cPlanner::findStrategy() {
                                             : comm_->cluster_ids[it->peerRank_];
                     size_t step =
                         (sendClusterId + comm_->nclusters - 1 - recvClusterId) %
-                        comm_->nclusters;
+                        comm_->nclusters;//流水线步骤step计算，体现了环形流水线的设计，根据P2P的发送方集群ID和接收方
+                        // 集群ID，计算出这个P2P操作应该属于流水线的哪一个时间步骤step
+                    //创建对应的flagcxC2cP2pOp对象
                     heteroFuncStep[step].addP2pOp(rank_, it->peerRank_, offset,
                                                   it->count_, it->isRecv_);
                   } else {
@@ -1691,9 +1753,10 @@ flagcxResult_t flagcxC2cPlanner::findStrategy() {
             }
           }
         }
+        //AllReduce特殊处理，分解为Reduce-Scatter+All-Gather两个阶段，因此需要更特殊的、两阶段的处理
         if (commOp_ == flagcxCommOpAllReduce &&
             algorithm_ == flagcxAlgoPipeline) {
-          refresh(2);
+          refresh(2);//重置缓冲区，准备进入第二阶段
           size_t clusterOffset = 0;
           for (size_t i = 0; i < clusterInterRankList_.size(); ++i) {
             for (size_t j = 0; j < clusterInterRankList_[i].size(); ++j) {
@@ -1703,7 +1766,8 @@ flagcxResult_t flagcxC2cPlanner::findStrategy() {
                 if (it->isScheduled_ && it->peerRank_ == -1) {
                   // broadcast local cluster data at post step 0
                   if (i == clusterId_) {
-                    postHomoFuncSteps_[0].emplace_back(
+                    postHomoFuncSteps_[0].emplace_back(//第一阶段Reduce-Scatter结束后，在本集群内部，把外交官收到
+                      //的规约好的数据块，广播给集群内所有成员，这里创建一个Broadcast同构操作
                         clusterInterRankList_[i][j] - (rank_ - homoMyRank_), 1,
                         1, it->offset_, it->offset_, it->count_, 2,
                         flagcxCommOpBroadcast);
@@ -1713,6 +1777,7 @@ flagcxResult_t flagcxC2cPlanner::findStrategy() {
                     if (c == i) {
                       continue;
                     }
+                    //为All-Gather第二阶段重建一批新的、待调度的缓冲区传输请求
                     interRankBufferInfoManager_.pushBackBufferInfo(
                         i, j + clusterOffset, it->offset_, it->count_, c, 0, 0,
                         -1, -1);
@@ -1728,7 +1793,7 @@ flagcxResult_t flagcxC2cPlanner::findStrategy() {
             clusterOffset += comm_->cluster_sizes[i];
           }
           interRankBufferInfoManager_.printBufferInfo(0);
-          searchHeteroSendRecvOps(1, 0);
+          searchHeteroSendRecvOps(1, 0);//再次调用调度器，为二阶段All-Gather搜索最优的P2P路径
           for (size_t j = 0; j < clusterInterRankList_.size(); ++j) {
             for (size_t z = 0; z < clusterInterRankList_[j].size(); ++z) {
               if (rank_ == clusterInterRankList_[j][z]) {
@@ -1751,7 +1816,8 @@ flagcxResult_t flagcxC2cPlanner::findStrategy() {
                         comm_->nclusters - 1;
                     heteroFuncStep[step].addP2pOp(rank_, it->peerRank_,
                                                   it->offset_, it->count_,
-                                                  it->isRecv_);
+                                                  it->isRecv_);//再次生成heteroFuncSteps，把第二阶段调度
+                                            // 好的P2P操作也添加到heteroFuncStep列表中，但放入的是后续的时间步骤
                   }
                 }
               }
@@ -1759,15 +1825,21 @@ flagcxResult_t flagcxC2cPlanner::findStrategy() {
           }
         }
 
+        //异构通信策略生成的后半部分，构建homoInterFuncSteps_代理间步骤和postHomoFuncSteps_同构后处理步骤，包括对
+        // 单网卡场景的独立处理逻辑
         for (size_t s = 0;
              s < nPipePreSteps_ + nSeqInterSteps_ + nPipePostSteps_; ++s) {
           heteroFuncSteps_[s].push_back(std::move(heteroFuncStep[s]));
         }
 
         // setup homoInterFuncs
+        //构建homoInterFuncSteps_代理间通信
+        //定义代理节点之间需要执行的集体通信操作
         flagcxCommOp_t homoInterFuncCommOp =
-            eachNicPerRank_ ? getC2cHomoCommOp(1, 0) : getC2cHomoCommOp(1, 1);
-        if (homoInterFuncCommOp == flagcxCommOpAllReduce) {
+            eachNicPerRank_ ? getC2cHomoCommOp(1, 0) : getC2cHomoCommOp(1, 1);//调用辅助函数getC2cHomoCommOp
+            //获取在inter阶段（阶段1），根据不同的多网卡模式，应该执行哪种通信操作
+        if (homoInterFuncCommOp == flagcxCommOpAllReduce) {//如果是AllReduce操作，创建一个flagcxC2cHomoFunc对象
+          //AllReduce只在代理节点组成的小通信组执行
           homoInterFuncSteps_[0].emplace_back(-1, sendType, recvType, 0, 0,
                                               totalCount_, 1,
                                               homoInterFuncCommOp);
@@ -1776,12 +1848,12 @@ flagcxResult_t flagcxC2cPlanner::findStrategy() {
                                               totalCount_,
                                               0, // use homo_comm
                                               homoInterFuncCommOp);
-        } else if (homoInterFuncCommOp == flagcxCommOpReduceScatter) {
+        } else if (homoInterFuncCommOp == flagcxCommOpReduceScatter) {//ReduceScatter操作进入复杂流水线for循环
           for (int c = 0; c < comm_->nclusters; ++c) {
             int step = algorithm_ == flagcxAlgoSequential
                            ? 0
                            : (clusterId_ + comm_->nclusters - 1 - c) %
-                                 comm_->nclusters;
+                                 comm_->nclusters;//环形流水线step计算，说明代理间通信也分成多个步骤，实现流水线并行
             if (step == comm_->nclusters - 1) {
               continue;
             }
@@ -1791,6 +1863,7 @@ flagcxResult_t flagcxC2cPlanner::findStrategy() {
             int recvFlag = algorithm_ == flagcxAlgoPipeline &&
                            commOp_ == flagcxCommOpReduceScatter &&
                            eachNicPerRank_ && step == comm_->nclusters - 2;
+            //为每个流水线步骤，都创建一个ReduceScatter的HomoFunc指令
             homoInterFuncSteps_[step].emplace_back(
                 -1, sendType, recvFlag ? 1 : recvType,
                 clusterOffset_ * rankCount, recvFlag ? 0 : recvoffset,
@@ -1810,17 +1883,21 @@ flagcxResult_t flagcxC2cPlanner::findStrategy() {
                                               homoInterFuncCommOp);
         }
 
-        if (!scheduleCompleted) {
+        //调度循环，允许迭代式调度：对于复杂的无法一次性完成调度的场景，可以一层一层的、迭代的完成调度
+        if (!scheduleCompleted) {//查询没有安排好P2P路径的
           refresh(0);
-          heteroAndHomoInterFuncLoops += 1;
+          heteroAndHomoInterFuncLoops += 1;//循环计数器增加，整个“搜索-调度-生成指令”过程再来一遍
         }
       }
     }
     interRankBufferInfoManager_.printBufferInfo(2);
 
     // setup postHomoFuncs
+    //构建同构后处理
+    //在代理间通信完成之后，每个同构子集群内部需要执行的操作
     flagcxCommOp_t postHomoFuncCommOp =
-        eachNicPerRank_ ? getC2cHomoCommOp(2, 0) : getC2cHomoCommOp(2, 1);
+        eachNicPerRank_ ? getC2cHomoCommOp(2, 0) : getC2cHomoCommOp(2, 1);//调用辅助函数getC2cHomoCommOp获取
+        // post阶段（阶段2）应该执行的操作
     if (postHomoFuncCommOp == flagcxCommOpAllReduce) {
       postHomoFuncSteps_[0].emplace_back(-1, sendType, 1, 0, 0, recvCount_, 2,
                                          postHomoFuncCommOp);
@@ -1828,8 +1905,10 @@ flagcxResult_t flagcxC2cPlanner::findStrategy() {
       postHomoFuncSteps_[0].emplace_back(-1, sendType, 1,
                                          clusterOffset_ * recvCount_, 0,
                                          recvCount_, 2, postHomoFuncCommOp);
-    } else if (postHomoFuncCommOp == flagcxCommOpBroadcast) {
-      for (size_t i = 0; i < clusterInterRankList_[clusterId_].size(); ++i) {
+    } else if (postHomoFuncCommOp == flagcxCommOpBroadcast) {//Broadcast是最常见的操作
+      //代理节点完成了代理间通信后，有了最终的全局结果，现在把结果广播给集群内所有的其它成员
+      //可能有多个外交官，每个有结果的一部分
+      for (size_t i = 0; i < clusterInterRankList_[clusterId_].size(); ++i) {//遍历所有外交官
         auto &buffList = interRankBufferInfoManager_.getBufferInfoList(
             clusterId_, clusterInterRankList_[clusterId_][i]);
         for (auto it = buffList.begin(); it != buffList.end(); it++) {
@@ -1837,14 +1916,14 @@ flagcxResult_t flagcxC2cPlanner::findStrategy() {
             if (commOp_ == flagcxCommOpAllGather && eachNicPerRank_) {
               size_t step = (comm_->cluster_ids[it->peerRank_] +
                              comm_->nclusters - 1 - clusterId_) %
-                            comm_->nclusters;
+                            comm_->nclusters;//step的计算表明广播操作也可以是流水线式，来匹配hetero和pre-homo阶段
               if (algorithm_ == flagcxAlgoPipeline) {
                 step = 0;
               }
               postHomoFuncSteps_[step].emplace_back(
                   clusterInterRankList_[clusterId_][i] - (rank_ - homoMyRank_),
                   1, 1, it->offset_, it->offset_, it->count_, 2,
-                  postHomoFuncCommOp);
+                  postHomoFuncCommOp);//为每个外交官创建一个broadcast指令，root参数是外交官的rank
             } else if (nPipePostSteps_ + nSeqPostSteps_ > 1) {
               size_t step = (comm_->cluster_ids[it->peerRank_] +
                              comm_->nclusters - clusterId_) %
@@ -1877,15 +1956,18 @@ flagcxResult_t flagcxC2cPlanner::findStrategy() {
                                          postHomoFuncCommOp);
     } else if (postHomoFuncCommOp == flagcxCommNoOp) {
     }
-  } else {
+  } else {//单网卡场景，对应!multiNic_
     // single-nic
     // setup preHomoFuncs
-    flagcxCommOp_t preHomoFuncCommOp = getC2cHomoCommOp(0, 2);
+    flagcxCommOp_t preHomoFuncCommOp = getC2cHomoCommOp(0, 2);//用辅助操作getC2cHomoCommOp获取单网卡模式（2）
+    // 模式下，pre-homo阶段（0）的操作
     auto &buffer =
         interRankBufferInfoManager_
             .getBufferInfoList(clusterId_, clusterInterRankList_[clusterId_][0])
             .front();
-    if (preHomoFuncCommOp == flagcxCommOpReduce) {
+    if (preHomoFuncCommOp == flagcxCommOpReduce) {//单网卡模式下，通常只有一个代理节点，pre-homo阶段是个简单reduce
+      //创建一个reduce指令，root参数指向唯一的代理节点clusterInterRankList_[clusterId_][0]
+      //单网卡模式的逻辑比多网卡模式简单，没有复杂的流水线和负载均衡计算
       preHomoFuncSteps_[0].emplace_back(
           clusterInterRankList_[clusterId_][0] - (rank_ - homoMyRank_), 0,
           recvType, buffer.offset_, buffer.offset_, buffer.count_, 0,
@@ -1900,15 +1982,24 @@ flagcxResult_t flagcxC2cPlanner::findStrategy() {
                                         preHomoFuncCommOp);
     }
 
+    //专门处理单网卡场景下的pre-homo，hetero，homo-inter和post-homo
+    //展示了一种不同于多网卡的、特殊优化的环形流水线算法
     // setup heteroFuncs
+    //为不同的操作类型commOp_提供了不同的P2P策略
+
+    //AllReduce、ReduceScatter和Reduce的策略
+    //AllReduce的跨集群部分，被分解成一系列P2P操作，用取模运算，为每个代理节点分配接收数据的上家和发送数据的下家
+    //代理节点之间形成了流水线式的环形Reduce-Scatter+All-Gather过程，每个步骤step中，每个代理节点都同时、并行地
+    //send和recv，最大化利用网络带宽
     if (commOp_ == flagcxCommOpAllReduce ||
         commOp_ == flagcxCommOpReduceScatter || commOp_ == flagcxCommOpReduce) {
       flagcxC2cHeteroFunc heteroFunc = flagcxC2cHeteroFunc();
-      for (size_t j = 0; j < clusterInterRankList_.size(); ++j) {
+      for (size_t j = 0; j < clusterInterRankList_.size(); ++j) {//循环遍历所有其它集群
         if (clusterId_ == j) {
           continue;
         }
         if (isRootCluster_ || commOp_ != flagcxCommOpReduce) {
+          //取模，为当前集群的每一个代理节点homoMyRank_，指定了一个需要负责接收数据的源集群，构成逻辑上数据流环
           int homoRankToRecvFromCluster =
               (comm_
                    ->globalrank2homorank[clusterInterRankList_[clusterId_][0]] -
@@ -1920,6 +2011,7 @@ flagcxResult_t flagcxC2cPlanner::findStrategy() {
           }
         }
         if (!isRootCluster_ || commOp_ != flagcxCommOpReduce) {
+          //同理，计算为每个代理节点，指定需要发送数据的目标rank
           int homoRankToSendToCluster =
               (comm_->globalrank2homorank[clusterInterRankList_[j][0]] -
                clusterId_ - 1 + comm_->cluster_sizes[j]) %
@@ -1928,6 +2020,7 @@ flagcxResult_t flagcxC2cPlanner::findStrategy() {
               homoRankToSendToCluster -
               comm_->globalrank2homorank[clusterInterRankList_[j][0]] +
               clusterInterRankList_[j][0];
+          //每个代理节点homoMyRank_在循环中检查自己是否被分配到了send或recv的任务
           if (homoMyRank_ ==
               comm_
                   ->globalrank2homorank[clusterInterRankList_[clusterId_][0]]) {
@@ -1943,7 +2036,7 @@ flagcxResult_t flagcxC2cPlanner::findStrategy() {
         }
       }
       heteroFuncSteps_[0].push_back(std::move(heteroFunc));
-    } else if (commOp_ == flagcxCommOpAllGather) {
+    } else if (commOp_ == flagcxCommOpAllGather) {//为AllGather设计的流水线式的P2P交换策略
       std::vector<flagcxC2cHeteroFunc> heteroFuncStep;
       for (size_t i = 0; i < nPipePreSteps_ + nSeqInterSteps_ + nPipePostSteps_;
            ++i) {
@@ -1955,8 +2048,9 @@ flagcxResult_t flagcxC2cPlanner::findStrategy() {
           recvOffset += comm_->cluster_sizes[i];
           continue;
         }
-        if (homoInterMyRank_ != -1) {
+        if (homoInterMyRank_ != -1) {//确保只有代理节点才能参与
           if (algorithm_ == flagcxAlgoPipeline) {
+            //环形流水线的step计算，表明AllGather的P2P交换也被分成了多个时间步骤
             size_t step =
                 (clusterId_ + comm_->nclusters - 1 - i) % comm_->nclusters;
             heteroFuncStep[step].addP2pOp(rank_, clusterInterRankList_[i][0],
@@ -1966,6 +2060,8 @@ flagcxResult_t flagcxC2cPlanner::findStrategy() {
                 rank_, clusterInterRankList_[i][0], recvOffset * sendCount_,
                 comm_->cluster_sizes[i] * sendCount_, 1);
           } else if (algorithm_ == flagcxAlgoSequential) {
+            //每个步骤step中，代理节点向某个目标发送自己有的数据块，在另一个对称的步骤comm_->nclusters - 1 - step中，
+            //从另一个集群接收它需要的数据块
             heteroFuncStep[0].addP2pOp(rank_, clusterInterRankList_[i][0],
                                        clusterOffset_ * sendCount_,
                                        clusterCount_ * sendCount_, 0);
@@ -1982,8 +2078,12 @@ flagcxResult_t flagcxC2cPlanner::findStrategy() {
     }
 
     // setup homoInterFuncs
-    flagcxCommOp_t homoInterFuncCommOp = getC2cHomoCommOp(1, 2);
+    //代理间通信
+    flagcxCommOp_t homoInterFuncCommOp = getC2cHomoCommOp(1, 2);//获取单网卡模式（2）下，inter阶段（1）的操作
+    //这里被设置为flagcxCommNoOp无操作或一个简单的AllReduce，因为单网卡模式下，每个集群只有一个代理，代理间通信就
+    //退化成了pre-homo和post-homo阶段的P2P操作，不需要独立的集体通信阶段
     if (homoInterFuncCommOp == flagcxCommOpAllReduce) {
+      //emplace_back在vector容器末尾添加新元素
       homoInterFuncSteps_[0].emplace_back(-1, sendType, recvType, 0, 0,
                                           totalCount_,
                                           0, // use homo_comm
@@ -1999,16 +2099,19 @@ flagcxResult_t flagcxC2cPlanner::findStrategy() {
     }
 
     // setup postHomoFuncs
-    flagcxCommOp_t postHomoFuncCommOp = getC2cHomoCommOp(2, 2);
+    //同构后处理
+    flagcxCommOp_t postHomoFuncCommOp = getC2cHomoCommOp(2, 2);//获取单网卡模式下，post阶段的操作
     if (postHomoFuncCommOp == flagcxCommOpReduceScatter) {
       postHomoFuncSteps_[0].emplace_back(-1, sendType, 1,
                                          clusterOffset_ * recvCount_, 0,
                                          recvCount_, 2, postHomoFuncCommOp);
-    } else if (postHomoFuncCommOp == flagcxCommOpBroadcast) {
+    } else if (postHomoFuncCommOp == flagcxCommOpBroadcast) {//最常见的操作是Broadcast
       size_t clusterOffset = 0;
       for (size_t i = 0; i < clusterInterRankList_.size(); ++i) {
         if (nPipePreSteps_ + nSeqInterSteps_ + nPipePostSteps_ > 1) {
           size_t step = (i + comm_->nclusters - clusterId_) % comm_->nclusters;
+          //代理节点同构hetero步骤收集到所有数据后，创建一系列broadcast指令，把最终的完整结果分发给集群内所有其它成员
+          //step表欧美，分发过程也可以是流水线式的，匹配数据到达的节奏
           postHomoFuncSteps_[step].emplace_back(
               clusterInterRankList_[clusterId_][0] - (rank_ - homoMyRank_),
               sendType, 1, clusterOffset * sendCount_,

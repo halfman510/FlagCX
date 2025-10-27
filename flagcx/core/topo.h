@@ -32,6 +32,7 @@
 // to GPU traffic consumes more PCI bandwidth.
 #define INTEL_P2P_OVERHEAD(bw) (bw * 6 / 5)
 
+//可检测的硬件类型
 #define FLAGCX_TOPO_NODE_TYPES 7
 #define APU 0
 #define PCI 1
@@ -169,7 +170,7 @@ struct flagcxTopoServer {
   uint64_t hostHashes[FLAGCX_TOPO_MAX_NODES];
   int nHosts;
   struct flagcxTopoNodeSet nodes[FLAGCX_TOPO_NODE_TYPES];
-  float maxBw;
+  float maxBw;//Bw是带宽
   float totalBw;
 };
 

@@ -288,6 +288,7 @@ flagcxProxyGetPostedOps(struct flagcxProxyState *proxyState, int *added) {
 
 FLAGCX_PARAM(ProgressAppendOpFreq, "PROGRESS_APPENDOP_FREQ", 8);
 
+//执行者工人代码
 inline void *flagcxProxyProgress(void *proxyState_) {
   struct flagcxProxyState *proxyState = (flagcxProxyState *)proxyState_;
   // flag indicating if there is any in-operating operation
@@ -303,25 +304,30 @@ inline void *flagcxProxyProgress(void *proxyState_) {
   deviceAdaptor->setDevice(proxyState->cudaDev);
   struct flagcxProxyProgressState *state = &proxyState->progressState;
 
+  //循环持续运行，直到收到停止信号state->stop == 1并且所有任务都已经完成idle == 1
   while (state->stop == 0 || idle == 0) {
-    idle = 1;
+    idle = 1;//假设本轮无事可做
     // consume the operations in the consumer queue
-    progressOps(proxyState, &idle);
+    progressOps(proxyState, &idle);//遍历当前消费者队列的所有异步操作
 
-    if (idle || (++proxyOpAppendCounter == flagcxParamProgressAppendOpFreq())) {
+    //(++proxyOpAppendCounter == flagcxParamProgressAppendOpFreq())优化
+    //引入计数器proxyOpAppendCounter和可配置的频率flagcxParamProgressAppendOpFreq，progress线程不是每次循环都去检查新任务，而是每隔N次循环才去检查一次
+    //降低了访问频率，提高性能
+    if (idle || (++proxyOpAppendCounter == flagcxParamProgressAppendOpFreq())) {//如果没有任务就去获取新任务
       int added = 0;
       proxyOpAppendCounter = 0;
       if (state->stop == 0) {
         // move all the operations from the producer queue to the consumer queue
-        flagcxProxyGetPostedOps(proxyState, &added);
+        flagcxProxyGetPostedOps(proxyState, &added);//加锁，然后把生产者队列中所有的待办任务，一次性移动到消费者队列，给下一轮progressOps处理
       }
       if (added == 0) {
         sched_yield(); // No request progressed. Let others run.
+        //完成当前任务，也没有从生产者队列获得新任务，调用sched_yield系统调用主动放弃当前的CPU时间片。
       }
     }
   }
 
-  flagcxProgressQueEmptyCheck(proxyState);
+  flagcxProgressQueEmptyCheck(proxyState);//最后做一次检查，退出
   return NULL;
 }
 
@@ -696,21 +702,25 @@ flagcxResult_t flagcxProxyInit(struct flagcxHeteroComm *comm) {
 
   flagcxSocket *proxySock = &comm->proxyState->peerSock;
   FLAGCXCHECK(flagcxSocketInit(proxySock, &comm->proxyState->listenSock.addr,
-                               comm->magic, flagcxSocketTypeProxy));
+                               comm->magic, flagcxSocketTypeProxy));//创建第二个套接字，去连接刚刚的监听套接字（第二个参数）
   FLAGCXCHECK(flagcxSocketConnect(proxySock));
 
+  //发送自己rank消息，让监听端知道这个连接是哪个rank的代理
   char proxyMsg[10];
   memcpy(proxyMsg, (string("Proxy: ") + to_string(comm->rank)).c_str(), 10);
   flagcxSocketSend(proxySock, proxyMsg, 10);
+  //用pthread_create创建了两个独立的、持续运行的后台线程，持续监听并接收来自其它或自己的通信任务请求，收到请求后放入基于共享内存的环形缓冲区中
   comm->proxyState->cudaDev = comm->cudaDev;
   pthread_create(&comm->proxyState->thread, NULL, flagcxProxyService,
-                 (void *)comm);
+                 (void *)comm);//flagcxProxyService接收和分派任务
   pthread_create(&comm->proxyState->progressState.thread, NULL,
-                 flagcxProxyProgress, comm->proxyState);
+                 flagcxProxyProgress, comm->proxyState);//执行具体的任务
   comm->proxyState->initialized = 1;
   return flagcxSuccess;
 }
 
+
+//service线程，调度者，这个后台线程一旦启动，就进入循环，直到收到停止信号，持续接收新任务，推进旧任务
 void *flagcxProxyService(void *args) {
   int stop = 0;
   int closeConn = 0;
@@ -721,25 +731,28 @@ void *flagcxProxyService(void *args) {
   struct flagcxSocket sock;
   flagcxResult_t res = flagcxSuccess;
 
+  //初始化与连接建立，线程启动后的准备工作
   // Set device context
-  FLAGCXCHECKGOTO(deviceAdaptor->setDevice(comm->cudaDev), res, out);
+  FLAGCXCHECKGOTO(deviceAdaptor->setDevice(comm->cudaDev), res, out);//确保setDevice设备上下文绑定正确
 
   // One peer only
   FLAGCXCHECKGOTO(flagcxSocketInit(&sock), res, out);
   FLAGCXCHECKGOTO(flagcxSocketAccept(&sock, &comm->proxyState->listenSock), res,
-                  out);
+                  out);//线程阻塞在这里，等待一个连接请求，对应flagcxProxyInit函数中的自连接flagcxSocketConnect
   char proxyMsg[10];
-  flagcxSocketRecv(&sock, proxyMsg, 10);
+  flagcxSocketRecv(&sock, proxyMsg, 10);//接收代理的rank消息，完成握手
   INFO(FLAGCX_PROXY,
        "[Service thread] Receive proxy message : \033[31m%s\033[0m", proxyMsg);
-  struct pollfd pollfds[1];
+  struct pollfd pollfds[1];//事件循环的核心机制，让操作系统内核监控sock.fd这个套接字，有数据可读POLLIN的时候通知
   pollfds[0].fd = sock.fd;
   pollfds[0].events = POLLIN;
 
+  //核心事件循环，循环一直运行，直到收到停止信号stop=1并且所有异步操作都已处理完毕（opHead为空）
   while (!stop || (stop && opHead)) {
     int ret;
     do {
-      ret = poll(pollfds, 1, asyncOpCount ? 0 : 500);
+      ret = poll(pollfds, 1, asyncOpCount ? 0 : 500);//poll是系统调用，让线程睡眠，直到监控套接字上有事件发生或超时
+      //如果当前有正在进行的异步操作asyncOpCount>0，timeout=0不阻塞立马推进旧人物；如果当前没有任务asyncOpCount==0，timeout设为500，线程睡眠半秒，等待新任务到来
     } while (ret < 0 && errno == EINTR);
     if (ret < 0) {
       WARN("[Proxy Service] Poll failed: %s", strerror(errno));
@@ -751,11 +764,11 @@ void *flagcxProxyService(void *args) {
     }
 
     // Progress all ops
-    list = opHead;
+    list = opHead;//遍历当前正在进行的异步操作链表opHead
     while (list) {
       struct flagcxProxyAsyncOp *opNext = list->next;
-      res = proxyProgressAsync(&opHead, list, &asyncOpCount);
-      if (res == flagcxSuccess || res == flagcxInProgress) {
+      res = proxyProgressAsync(&opHead, list, &asyncOpCount);//对每个操作调用proxyProgressAsync函数推进它的状态
+      if (res == flagcxSuccess || res == flagcxInProgress) {//如果一个操作已经完成（res == flagcxSuccess）就被链表移除，如果在进行中res == flagcxInProgress，继续保留在链表，等待下一次循环再推进
         list = opNext;
       } else {
         WARN("[Service thread] Error encountered progressing operation with "
@@ -770,11 +783,12 @@ void *flagcxProxyService(void *args) {
     }
 
     // Check for additional ops coming in
+    //接收新操作
     int type;
-    if (pollfds[0].revents & POLLIN) {
+    if (pollfds[0].revents & POLLIN) {//如果poll告诉套接字上有新数据POLLIN，代码进入这个分支
       int closed = 0;
       res = flagcxSocketTryRecv(&sock, &type, sizeof(int), &closed,
-                                false /*blocking*/);
+                                false /*blocking*/);//flagcxSocketTryRecv非阻塞地尝试从套接字接收一个操作类型type
       if (res != flagcxSuccess && res != flagcxInProgress) {
         WARN("[Service thread] Could not receive type from rank %d, "
              "res=%u, "
@@ -786,11 +800,11 @@ void *flagcxProxyService(void *args) {
              comm->rank);
         closeConn = 1;
       } else if (res == flagcxSuccess) {
-        if (type == flagcxProxyMsgStop) {
+        if (type == flagcxProxyMsgStop) {//停止消息
           stop = 1;
           closeConn = 1;
-        } else if (proxyMatchOpType(type)) {
-          res = proxyServiceInitOp(type, &sock, &opHead, comm, &asyncOpCount);
+        } else if (proxyMatchOpType(type)) {//已知的通信操作类型，如send和revc，调用proxyServiceInitOp
+          res = proxyServiceInitOp(type, &sock, &opHead, comm, &asyncOpCount);//从套接字读取操作需要的所有参数，创建一个新的flagcxProxyAsyncOp对象，加入到onHead链表的头部
           if (res != flagcxSuccess) {
             WARN("[Service thread] Error encountered initializing operation "
                  "with res=%d, closing connection",
@@ -808,15 +822,18 @@ void *flagcxProxyService(void *args) {
       break;
     }
   }
+
+//清理与退出：主线程退出后，执行最后的清理工作
 out:
   // Stop progress thread before freeing any resource
   pthread_mutex_lock(&comm->proxyState->mutex);
-  comm->proxyState->progressState.stop = 1;
+  comm->proxyState->progressState.stop = 1;//通知flagcxProxyProgress工人线程停止，设置stop标志
   pthread_cond_signal(&comm->proxyState->cond);
   pthread_mutex_unlock(&comm->proxyState->mutex);
-  pthread_join(comm->proxyState->progressState.thread, nullptr);
+  pthread_join(comm->proxyState->progressState.thread, nullptr);//阻塞等待，直到工人线程完全退出，确保释放资源之前，没有其它任何线程都在使用它们
 
   // Close sockets
+  //关闭套接字
   flagcxSocketClose(&sock);
   flagcxSocketClose(&comm->proxyState->listenSock);
 

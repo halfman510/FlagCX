@@ -39,8 +39,8 @@ struct flagcxComm {
   int *cluster_inter_ranks;
   bootstrapState *bootstrap;
   flagcxInnerComm_t host_comm;
-  flagcxInnerComm_t homo_comm;
-  flagcxHeteroComm_t hetero_comm;
+  flagcxInnerComm_t homo_comm;//同构通信器handle
+  flagcxHeteroComm_t hetero_comm;//异构通信器handle
   // experimental for multi-nic support
   int homoInterRootRank;
   int homoInterMyRank;

@@ -197,7 +197,7 @@ public:
 
 class flagcxC2cPlanner {
 public:
-  friend class flagcxAlgoTimeEstimator;
+  friend class flagcxAlgoTimeEstimator;//友元类可以访问当前类中的所有成员，包括private
   flagcxC2cPlanner(size_t sendCount, size_t recvCount, int rootRank,
                    flagcxComm_t comm, flagcxCommOp_t commOp,
                    flagcxRedOp_t redOp);

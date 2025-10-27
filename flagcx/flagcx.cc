@@ -387,6 +387,7 @@ flagcxResult_t flagcxCommInitRank(flagcxComm_t *comm, int nranks,
                                    &((*comm)->homo_comm)));
   }
 
+  // 异构通信调用设置
   if (!is_homo_comm(*comm)) {
     // Reset commId and hetero root rank calls flagcxHeteroGetUniqueId
     memset((void *)commId, 0, sizeof(flagcxUniqueId));
@@ -411,56 +412,63 @@ flagcxResult_t flagcxCommInitRank(flagcxComm_t *comm, int nranks,
     }
   }
 
+  //针对多网卡的跨集群通信优化
+  //是一个分布式选举算法，每个集群内先选出自己的外交更换，外交官之间再进行信息传输，把结果广播回自己的集群，这种代理模式优化异构通信
+  //先收集信息：每个rank获取自己的网络距离并且同步全局
+  //再分组选举：每个异构集群都根据网络距离选出距离外面最近的一批ranks
+  //最后确定角色：每个rank确认自己是否被选中为外交官
   if (!is_homo_comm(*comm)) {
     // Experimental for multi-nic support
     // Collect nic distance to ranks
-    (*comm)->clusterInterRankList.resize((*comm)->nclusters);
+    (*comm)->clusterInterRankList.resize((*comm)->nclusters);//每个元素存储一个集群的rank列表
     struct flagcxNicDistance *nicDistanceData;
-    FLAGCXCHECK(flagcxCalloc(&nicDistanceData, nranks));
+    FLAGCXCHECK(flagcxCalloc(&nicDistanceData, nranks));//分配内存用来收集所有ranks收集的网卡距离的信息
     const char *enableTopoDetect = flagcxGetEnv("FLAGCX_ENABLE_TOPO_DETECT");
     if (enableTopoDetect && strcmp(enableTopoDetect, "TRUE") ==
                                 0) { // safety check nic distance is only
                                      // available after topo detection
+                                     // 如果开启拓扑检测，调用函数获取当前rank到其它集群之间的真实网络距离（类似网络跳数、延迟）
       FLAGCXCHECK(flagcxGetNicDistance((*comm)->hetero_comm->topoServer, rank,
                                        nicDistanceData + rank));
-    } else {
+    } else {//如果没有开启拓扑检测，为了让代码能工作，伪造一个虚拟的距离值，偶数rank距离是1，奇数rank距离是2
       nicDistanceData[rank].distance = rank % 2 + 1;
       nicDistanceData[rank].netGuid = rank; // give a dummy value
     }
     FLAGCXCHECK(bootstrapAllGather(state, (void *)nicDistanceData,
                                    sizeof(flagcxNicDistance)));
     FLAGCXCHECK(bootstrapBarrier(state, rank, nranks, 0));
-    for (int i = 0; i < (*comm)->nclusters; ++i) {
+
+    for (int i = 0; i < (*comm)->nclusters; ++i) {//外层循环，遍历每一个同构子集群，比如先处理英伟达、再处理昆仑芯
       int minDistance = INT_MAX;
       std::unordered_map<int, std::vector<int>> nicDistanceToRanks;
       std::unordered_map<int, std::unordered_set<uint64_t>> nicDistanceToNic;
-      for (int j = 0; j < nranks; ++j) {
-        if (clusterIdData[j] != i) {
+      for (int j = 0; j < nranks; ++j) {//内存循环，遍历通信组里面所有的ranks
+        if (clusterIdData[j] != i) {//判断rank j是否属于当前正在处理的集群i，如果不属于就跳过
           continue;
         }
         int val = nicDistanceData[j].distance;
         uint64_t netGuid = nicDistanceData[j].netGuid;
         if (nicDistanceToNic[val].find(netGuid) ==
             nicDistanceToNic[val].end()) {
-          nicDistanceToRanks[val].push_back(j);
-          nicDistanceToNic[val].insert(netGuid);
+          nicDistanceToRanks[val].push_back(j);//进行分组操作，nicDistanceToRanks是一个map，key是网络距离，value是这个距离的rank列表，负责将属于当前集群的rank按照网络距离进行分组
+          nicDistanceToNic[val].insert(netGuid);//辅助map，处理多个rank共享一张物理网卡的情况，通过netGuid唯一标识符进行去重，确保同一距离下，同一张网卡只被考虑一次
         }
-        minDistance = std::min(minDistance, val);
+        minDistance = std::min(minDistance, val);//遍历过程中，不断寻找当前ranks中，最小的网络距离数值，最后表示集群i中离其它集群最近的距离
       }
       (*comm)->clusterInterRankList[i] =
-          std::move(nicDistanceToRanks[minDistance]);
+          std::move(nicDistanceToRanks[minDistance]);//从nicDistanceToRanks这个map中取出距离为minDistance的所有rank列表，这个列表就是被选中的网络位置最好的外交官。
     }
     // Set homoInterMyRank, homoInterRootRank and homoInterRanks
     auto &myClusterInterRanks =
-        (*comm)->clusterInterRankList[clusterIdData[rank]];
+        (*comm)->clusterInterRankList[clusterIdData[rank]];//获取当前进程所属集群的外交官列表
     for (size_t i = 0; i < myClusterInterRanks.size(); ++i) {
-      if (rank == myClusterInterRanks[i]) {
-        (*comm)->homoInterMyRank = i;
+      if (rank == myClusterInterRanks[i]) {//当前进程检查自己是否在外交官名单中
+        (*comm)->homoInterMyRank = i;//在就记录下自己在小组内的本地排名（是几号）
       }
     }
     if ((*comm)->homoInterMyRank != -1) {
-      (*comm)->homoInterRootRank = myClusterInterRanks[0];
-      (*comm)->homoInterRanks = myClusterInterRanks.size();
+      (*comm)->homoInterRootRank = myClusterInterRanks[0];//记录外交官的领队，这里默认为小组的第一个成员
+      (*comm)->homoInterRanks = myClusterInterRanks.size();//记录外交官总数
     }
 
     INFO(

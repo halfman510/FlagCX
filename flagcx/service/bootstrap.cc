@@ -26,19 +26,23 @@ union flagcxSocketAddress bootstrapNetIfAddr;
 static int bootstrapNetInitDone = 0;
 pthread_mutex_t bootstrapNetLock = PTHREAD_MUTEX_INITIALIZER;
 
+//所有进程中选择一个用于bootstrap初始协调的网络接口NIC，并准备好地址信息
+//解决初次握手问题
 flagcxResult_t bootstrapNetInit() {
-  if (bootstrapNetInitDone == 0) {
-    pthread_mutex_lock(&bootstrapNetLock);
-    if (bootstrapNetInitDone == 0) {
-      const char *env = flagcxGetEnv("FLAGCX_COMM_ID");
-      if (env) {
+  if (bootstrapNetInitDone == 0) {//无锁的快速检查，如果初始化已经完成，函数直接返回，开销极小
+    pthread_mutex_lock(&bootstrapNetLock);//如果可能需要初始化，就获取互斥锁
+    if (bootstrapNetInitDone == 0) {//第二次检查，获取锁之后再次检查标记位，为了防止A等待锁的时候，B已经完成初始化；如果没有第二次检查，线程A获取锁之后会重复初始化导致错误。
+      const char *env = flagcxGetEnv("FLAGCX_COMM_ID");//这个环境变量是根进程rank0的地址IP+端口
+      if (env) {//指定了集结点的情况，FLAGCX_COMM_ID不为空
         union flagcxSocketAddress remoteAddr;
-        if (flagcxSocketGetAddrFromString(&remoteAddr, env) != flagcxSuccess) {
+        if (flagcxSocketGetAddrFromString(&remoteAddr, env) != flagcxSuccess) {//flagcxSocketGetAddrFromString把字符串形式的地址解析成标准的SocketAddress结构体
           WARN("Invalid FLAGCX_COMM_ID, please use format: <ipv4>:<port> or "
                "[<ipv6>]:<port> or <hostname>:<port>");
           pthread_mutex_unlock(&bootstrapNetLock);
           return flagcxInvalidArgument;
         }
+        //flagcxFindInterfaceMatchSubnet找到和目标地址在同一个子网的网络接口，把本地本地接口的地址信息存入bootstrapNetIfAddr
+        //在多网卡的服务器上，选择和目标地址在同一个子网的接口，可以确保选择了正确的用于高性能计算的高速网卡，而不是慢的管理网卡
         if (flagcxFindInterfaceMatchSubnet(bootstrapNetIfName,
                                            &bootstrapNetIfAddr, &remoteAddr,
                                            MAX_IF_NAME_SIZE, 1) <= 0) {
@@ -46,20 +50,21 @@ flagcxResult_t bootstrapNetInit() {
           pthread_mutex_unlock(&bootstrapNetLock);
           return flagcxSystemError;
         }
-      } else {
+      } else {//没有指定集结点的情况，FLAGCX_COMM_ID为空（这种情况一般只在rank0进程自己身上发生）
         int nIfs = flagcxFindInterfaces(bootstrapNetIfName, &bootstrapNetIfAddr,
-                                        MAX_IF_NAME_SIZE, 1);
-        if (nIfs <= 0) {
+                                        MAX_IF_NAME_SIZE, 1);//flagcxFindInterfaces遍历本机所有的网络接口，根据预设规则，选择一个看起来最合适的接口作为默认的引导网络接口
+        if (nIfs <= 0) {//如果找不到一个可用的网络接口，说明这台机器网络环境有问题，函数报错
           WARN("Bootstrap : no socket interface found");
           pthread_mutex_unlock(&bootstrapNetLock);
           return flagcxInternalError;
         }
       }
+      //把最终选定的网络接口名bootstrapNetIfName和地址bootstrapNetIfAddr格式化成一个可读的字符串
       char line[SOCKET_NAME_MAXLEN + MAX_IF_NAME_SIZE + 2];
       sprintf(line, " %s:", bootstrapNetIfName);
       flagcxSocketToString(&bootstrapNetIfAddr, line + strlen(line));
-      INFO(FLAGCX_NET, "Bootstrap : Using%s", line);
-      bootstrapNetInitDone = 1;
+      INFO(FLAGCX_NET, "Bootstrap : Using%s", line);//打印出来信息，方便调试
+      bootstrapNetInitDone = 1;//所有工作完成后，标志位置为1，初始化已成功完成
     }
     pthread_mutex_unlock(&bootstrapNetLock);
   }
@@ -121,6 +126,8 @@ static flagcxResult_t setFilesLimit() {
   return flagcxSuccess;
 }
 
+//协调员线程coordinator thread，是只在rank0上运行的后台线程
+//体现了收集-处理-分发的协调模式
 static void *bootstrapRoot(void *rargs) {
   struct bootstrapRootArgs *args = (struct bootstrapRootArgs *)rargs;
   struct flagcxSocket *listenSock = args->listenSock;
@@ -137,25 +144,29 @@ static void *bootstrapRoot(void *rargs) {
 
   TRACE(FLAGCX_INIT, "BEGIN");
   /* Receive addresses from all ranks */
+  //监听循环一直运行，直到接收到所有nranks个进程的连接请求
   do {
     struct flagcxSocket sock;
     FLAGCXCHECKGOTO(flagcxSocketInit(&sock), res, out);
-    FLAGCXCHECKGOTO(flagcxSocketAccept(&sock, listenSock), res, out);
-    FLAGCXCHECKGOTO(bootstrapNetRecv(&sock, &info, sizeof(info)), res, out);
+    FLAGCXCHECKGOTO(flagcxSocketAccept(&sock, listenSock), res, out);//阻塞点，线程在这里睡眠，等待新进程连接到监听套接字
+    FLAGCXCHECKGOTO(bootstrapNetRecv(&sock, &info, sizeof(info)), res, out);//新连接被接收后，从这个连接接收对方的extInfo结构体
     FLAGCXCHECKGOTO(flagcxSocketClose(&sock), res, out);
 
+    //首次连接处理，第一个进程rank0连接的时候，才知道这次任务的总进程数是多少
     if (c == 0) {
       nranks = info.nranks;
-      FLAGCXCHECKGOTO(flagcxCalloc(&rankAddresses, nranks), res, out);
-      FLAGCXCHECKGOTO(flagcxCalloc(&rankAddressesRoot, nranks), res, out);
+      FLAGCXCHECKGOTO(flagcxCalloc(&rankAddresses, nranks), res, out);//公开信箱地址
+      FLAGCXCHECKGOTO(flagcxCalloc(&rankAddressesRoot, nranks), res, out);//私有信箱地址，接收rank0指令
     }
 
+    //错误检查，检查后续连接的nranks是否与第一个一致
     if (nranks != info.nranks) {
       WARN("Bootstrap Root : mismatch in rank count from procs %d : %d", nranks,
            info.nranks);
       goto out;
     }
 
+    //检查某个rank是否重复报道
     if (memcmp(zero, &rankAddressesRoot[info.rank],
                sizeof(union flagcxSocketAddress)) != 0) {
       WARN("Bootstrap Root : rank %d of %d ranks has already checked in",
@@ -172,27 +183,29 @@ static void *bootstrapRoot(void *rargs) {
     memcpy(rankAddresses + info.rank, &info.extAddressListen,
            sizeof(union flagcxSocketAddress));
 
-    ++c;
+    ++c;//c是接收计数器，+1，继续accept下一个连接，直到c=nranks
     TRACE(FLAGCX_INIT, "Received connect from rank %d total %d/%d", info.rank,
           c, nranks);
   } while (c < nranks);
   TRACE(FLAGCX_INIT, "COLLECTED ALL %d HANDLES", nranks);
 
   // Send the connect handle for the next rank in the AllGather ring
-  for (int r = 0; r < nranks; ++r) {
+  //分发环邻居指令，收集完所有信息后，bootstrapRoot线程主动向每一个线程下发建立环连接的指令
+  for (int r = 0; r < nranks; ++r) {//遍历所有rank
     int next = (r + 1) % nranks;
     struct flagcxSocket sock;
     FLAGCXCHECKGOTO(flagcxSocketInit(&sock, rankAddressesRoot + r, magic,
                                      flagcxSocketTypeBootstrap),
-                    res, out);
+                    res, out);//建立临时套接字，连到r的私有信箱
     FLAGCXCHECKGOTO(flagcxSocketConnect(&sock), res, out);
     FLAGCXCHECKGOTO(bootstrapNetSend(&sock, rankAddresses + next,
                                      sizeof(union flagcxSocketAddress)),
-                    res, out);
+                    res, out);//把rank next的公开信箱发送给rank r
     FLAGCXCHECKGOTO(flagcxSocketClose(&sock), res, out);
   }
   INFO(FLAGCX_INIT, "SENT OUT ALL %d HANDLES", nranks);
 
+  //完成所有协调任务后，或中间碰到错误时，跳转到out标签处
 out:
   if (listenSock != NULL) {
     flagcxSocketClose(listenSock);
@@ -259,6 +272,7 @@ struct unexConn {
   struct unexConn *next;
 };
 
+//服务器-客户端握手+环建立
 flagcxResult_t bootstrapInit(struct flagcxBootstrapHandle *handle,
                              void *commState) {
   struct bootstrapState *state = (struct bootstrapState *)commState;
@@ -270,9 +284,10 @@ flagcxResult_t bootstrapInit(struct flagcxBootstrapHandle *handle,
 
   TRACE(FLAGCX_INIT, "rank %d nranks %d", rank, nranks);
 
-  info.rank = rank;
+  info.rank = rank;//把rank、nranks以及下面两个套接字的地址都放入，打包进一个extInfo结构体
   info.nranks = nranks;
   // Create socket for other ranks to contact me
+  //每个进程启动后，创建两个监听套接字，第一个套接字公开广播给其它进程，用于建立环
   FLAGCXCHECK(flagcxSocketInit(&state->listenSock, &bootstrapNetIfAddr,
                                state->magic, flagcxSocketTypeBootstrap,
                                state->abortFlag));
@@ -280,6 +295,7 @@ flagcxResult_t bootstrapInit(struct flagcxBootstrapHandle *handle,
   FLAGCXCHECK(flagcxSocketGetAddr(&state->listenSock, &info.extAddressListen));
 
   // Create socket for root to contact me
+  //第二个套接字专门接收rank0根进程的信息
   FLAGCXCHECK(flagcxSocketInit(&listenSockRoot, &bootstrapNetIfAddr,
                                state->magic, flagcxSocketTypeBootstrap,
                                state->abortFlag));
@@ -287,17 +303,19 @@ flagcxResult_t bootstrapInit(struct flagcxBootstrapHandle *handle,
   FLAGCXCHECK(flagcxSocketGetAddr(&listenSockRoot, &info.extAddressListenRoot));
 
   // stagger connection times to avoid an overload of the root
+  //错峰连接根进程rank0
   if (nranks > 128) {
     long msec = rank;
     struct timespec tv;
     tv.tv_sec = msec / 1000;
-    tv.tv_nsec = 1000000 * (msec % 1000);
+    tv.tv_nsec = 1000000 * (msec % 1000);//每个进程根据自己的进程号等待一段时间，号越大等待时间越长，这样请求分散开了
     TRACE(FLAGCX_INIT, "rank %d delaying connection to root by %ld msec", rank,
           msec);
     (void)nanosleep(&tv, NULL);
   }
 
   // send info on my listening socket to root
+  //每个进程创建一个临时套接字，连接handle->addr指定的根进程地址，把自己的info结构体发过去，发送后关闭这个连接
   FLAGCXCHECK(flagcxSocketInit(&sock, &handle->addr, state->magic,
                                flagcxSocketTypeBootstrap, state->abortFlag));
   FLAGCXCHECK(flagcxSocketConnect(&sock));
@@ -305,10 +323,11 @@ flagcxResult_t bootstrapInit(struct flagcxBootstrapHandle *handle,
   FLAGCXCHECK(flagcxSocketClose(&sock));
 
   // get info on my "next" rank in the bootstrap ring from root
+  //在第二个私有信箱连接根进程的套接字上等待，根进程收集完信息之后，会逐一连接每个进程，告诉它下一步怎么做
   FLAGCXCHECK(flagcxSocketInit(&sock));
   FLAGCXCHECK(flagcxSocketAccept(&sock, &listenSockRoot));
   FLAGCXCHECK(
-      bootstrapNetRecv(&sock, &nextAddr, sizeof(union flagcxSocketAddress)));
+      bootstrapNetRecv(&sock, &nextAddr, sizeof(union flagcxSocketAddress)));//从根进程那边接收下一个邻居的地址，创建套接字主动连接它
   FLAGCXCHECK(flagcxSocketClose(&sock));
   FLAGCXCHECK(flagcxSocketClose(&listenSockRoot));
 
@@ -316,15 +335,18 @@ flagcxResult_t bootstrapInit(struct flagcxBootstrapHandle *handle,
                                flagcxSocketTypeBootstrap, state->abortFlag));
   FLAGCXCHECK(flagcxSocketConnect(&state->ringSendSocket));
   // Accept the connect request from the previous rank in the AllGather ring
+  //在第一个公开信箱中等待前一个邻居来联系自己
   FLAGCXCHECK(flagcxSocketInit(&state->ringRecvSocket));
   FLAGCXCHECK(flagcxSocketAccept(&state->ringRecvSocket, &state->listenSock));
+  //上面的过程是建立逻辑环
 
   // AllGather all listen handlers
+  //最终的信息同步，确保所有进程都有完整的通信地址簿
   FLAGCXCHECK(flagcxCalloc(&state->peerCommAddresses, nranks));
   FLAGCXCHECK(
       flagcxSocketGetAddr(&state->listenSock, state->peerCommAddresses + rank));
   FLAGCXCHECK(bootstrapAllGather(state, state->peerCommAddresses,
-                                 sizeof(union flagcxSocketAddress)));
+                                 sizeof(union flagcxSocketAddress)));//每个进程把自己的第一个公开信箱地址放入peerCommAddresses数组的对应位置，然后调用bootstrapAllGather广播给所有进程
 
   INFO(FLAGCX_INIT, "rank %d nranks %d - DONE", rank, nranks);
 
@@ -706,6 +728,7 @@ flagcxResult_t bootstrapRingAllReduce(struct flagcxSocket *prevSocket,
                                       flagcxDataType_t datatype,
                                       flagcxRedOp_t op) {
 
+  //prevSocket和nextSocket是前后两个套接字，count输入元素的数量，datatype类型，op规约操作
   // The ring algorithm works as follows.
   //
   // The given input is split into a number of chunks equal to the
@@ -716,26 +739,30 @@ flagcxResult_t bootstrapRingAllReduce(struct flagcxSocket *prevSocket,
   // final ranks may have partial output or may be empty.
   //
 
+  //自适应块大小
+  //把AllReduce的整个数组大小，逻辑上划分成nranks个大小差不多的数据块chunk
   size_t size = count * getFlagcxDataTypeSize(datatype);
-  size_t ChunkBytes = std::max((size + nranks - 1) / nranks, MIN_CHUNK_SIZE);
+  size_t ChunkBytes = std::max((size + nranks - 1) / nranks, MIN_CHUNK_SIZE);//计算每个数据块的大概字节数，不能小于预设的最小值
+  //预设最小值是为了防止块内容太小，协议IP头的开销占比大，效率低
   // Ensure that min chunk size is a multiple of the element size.
-  ChunkBytes = roundUp(ChunkBytes, getFlagcxDataTypeSize(datatype));
+  ChunkBytes = roundUp(ChunkBytes, getFlagcxDataTypeSize(datatype));//roundUp函数向上调整，确保块大小是数据类型大小的整数倍
   INFO(FLAGCX_COLL, "rank %d nranks %d; size=%lu; typesize=%lu; ChunkBytes=%lu",
        rank, nranks, size, getFlagcxDataTypeSize(datatype), ChunkBytes);
+       //分块是为了在环的不同链路上同时进行计算和传输，最大化的利用网络带宽
 
   // step 1: split the data and prepare offset and length array
-  std::vector<size_t> offset(nranks, 0);
-  std::vector<size_t> length(nranks, 0);
+  std::vector<size_t> offset(nranks, 0);//存储第i个数据块的起始位置偏移量
+  std::vector<size_t> length(nranks, 0);//存储第i个数据块的长度
   for (size_t i = 0; i < nranks; ++i) {
-    if (ChunkBytes * i >= size) {
+    if (ChunkBytes * i >= size) {//处理空块
       offset[i] = size;
       length[i] = 0;
       continue;
     }
     offset[i] = ChunkBytes * i;
     length[i] =
-        ChunkBytes * (i + 1) >= size ? size - ChunkBytes * i : ChunkBytes;
-  }
+        ChunkBytes * (i + 1) >= size ? size - ChunkBytes * i : ChunkBytes;//由于整数除法+roundUp，所有块的长度加起来可能稍微>总数据大小size
+  }//前面的块<size，长度是标准的ChunkBytes；最后一个非空块可能大于size，长度裁剪成size - ChunkBytes * i，从当前的起始位置到数组末尾的所有剩余数据。
 
   // step 2: reduce scatter
   FLAGCXCHECK(bootstrapRingReduceScatter(
